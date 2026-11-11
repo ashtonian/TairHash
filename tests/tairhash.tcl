@@ -487,6 +487,47 @@ start_server {tags {"tairhash"} overrides {bind 0.0.0.0}} {
         assert_equal 0 [r dbsize]  
     }
 
+    test {Rename and move keys of other types} {
+        r select 11
+        r del strkey strkey2
+        r set strkey val
+        r rename strkey strkey2
+        r move strkey2 12
+        assert_equal 0 [r exists strkey2]
+        r select 12
+        assert_equal val [r get strkey2]
+        r del strkey2
+        r select 8
+    }
+
+    test {Rename a key without expiring fields, then delete it} {
+        r select 11
+        r del renkey renkey2
+        r exhset renkey f1 v
+        r rename renkey renkey2
+        # The rename must not leave a pending rename behind for the next keyspace event.
+        r del renkey2
+        assert_equal PONG [r ping]
+        r select 8
+    }
+
+    test {Active expire after renaming a key without expiring fields} {
+        r select 11
+        r del renkey renkey2
+        r exhset renkey f1 v
+        r rename renkey renkey2
+        r exhset renkey2 f2 v px 200
+
+        # EXHLEN neither triggers nor filters expiration, so only active expire can bring it to 1.
+        wait_for_condition 50 100 {
+            [r exhlen renkey2] == 1
+        } else {
+            fail "field set after rename was not actively expired"
+        }
+        r del renkey2
+        r select 8
+    }
+
     test {Active expire rdb} {
         r del tairhashkey
 
