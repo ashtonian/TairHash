@@ -999,10 +999,19 @@ OK
 
 Write commands replicate the resulting state of each field they wrote rather than the
 request, so a replica or an AOF replay reproduces values, versions and TTLs exactly,
-independently of its own clock and state. Each field is propagated as
-`EXHSET key field value ABS <version> [PXAT <expire>]`, with the expire as an absolute
-unix time in milliseconds. A field that `EXHSETNX` created and nothing has written since
-has version 0, which `EXHSET` cannot set, and is propagated as `EXHSETNX key field value`.
-The fields of one write command are propagated together in a MULTI/EXEC. AOF rewrite
-emits the same commands. Every TairHash version accepts them, so replicas and AOF files
-stay compatible across versions.
+independently of its own clock and state. The `replication_format` module option chooses
+the commands:
+
+- `state` (the default): one internal
+  `EXHMSETREPL key 1 field value version expire [field value version expire ...]` per write
+  command, with the expire as an absolute unix time in milliseconds, 0 for none. The `1`
+  names the argument layout; a node rejects a layout it does not know. AOF rewrite emits
+  `EXHMSETREPL` with up to 64 fields each. `EXHMSETREPL` is accepted only from the
+  replication stream or while loading; a regular client gets
+  `ERR only accepted from the replication stream or while loading` (servers older than
+  Redis 6.2 cannot report where a command comes from, so they always accept it).
+- `compat`: one `EXHSET key field value ABS <version> [PXAT <expire>]` per field, or
+  `EXHSETNX key field value` for a field at version 0, which `EXHSET` cannot set (only data
+  written by TairHash 1.x has it). The fields of one write command are propagated together
+  in a MULTI/EXEC. TairHash 1.x accepts these commands, which is what an upgrade relies on;
+  see the README.
