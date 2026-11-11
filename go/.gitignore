@@ -1,0 +1,5 @@
+.cache/
+*.pprof
+*.test
+bench/results/
+.DS_Store
