@@ -130,6 +130,17 @@ cmake ../ && make -j
 ```
 then the tairhash_module.so library file will be generated in the lib directory
 
+Build options (`cmake -D<option>=ON ../`):
+
+| Option | Default | Description |
+|---|---|---|
+| `SORT_MODE` / `SLAB_MODE` | `OFF` | Active expire algorithm (default: SCAN mode) |
+| `TAIRHASH_NATIVE_ARCH` | `OFF` | Optimize for the build host's CPU (`-march=native`). Only for a library built on the host that runs it: a binary built this way can crash with SIGILL on another CPU, for example a Docker image built on a CI runner. SLAB mode's AVX2 path needs it on x86. |
+| `TAIRHASH_LTO` | `OFF` | Link-time optimization |
+| `TAIRHASH_OUTPUT_DIR` | `lib/` | Directory the library is written to |
+| `SANITIZER_MODE` | unset | `address`, `undefined` or `thread` |
+| `GCOV_MODE` | `OFF` | Coverage instrumentation |
+
 ```
 ./redis-server --loadmodule /path/to/tairhash_module.so
 ```  

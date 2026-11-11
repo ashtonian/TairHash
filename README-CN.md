@@ -128,6 +128,17 @@ cmake ../ && make -j
 ```
 ./redis-server --loadmodule /path/to/tairhash_module.so
 ```  
+编译选项（`cmake -D<选项>=ON ../`）：
+
+| 选项 | 默认值 | 说明 |
+|---|---|---|
+| `SORT_MODE` / `SLAB_MODE` | `OFF` | 主动过期算法（默认SCAN模式） |
+| `TAIRHASH_NATIVE_ARCH` | `OFF` | 针对编译机器的CPU优化（`-march=native`）。仅适用于在运行机器上编译：这样编译的二进制在其他CPU上可能因SIGILL崩溃，例如在CI上构建的Docker镜像。x86上SLAB模式的AVX2路径需要开启。 |
+| `TAIRHASH_LTO` | `OFF` | 链接时优化 |
+| `TAIRHASH_OUTPUT_DIR` | `lib/` | 模块库的输出目录 |
+| `SANITIZER_MODE` | 未设置 | `address`、`undefined` 或 `thread` |
+| `GCOV_MODE` | `OFF` | 覆盖率插桩 |
+
 ## 测试方法
 
 `tests/run.sh` 会编译模块，并在Redis源码的测试框架中运行 `tests/` 下的TCL测试（与CI一致）。Redis源码只会在 `.deps/` 下克隆并编译一次；每种模块变体编译到 `build/` 下各自的目录。
