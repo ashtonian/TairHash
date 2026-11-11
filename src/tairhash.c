@@ -842,6 +842,23 @@ int mstring2ld(RedisModuleString *val, long double *r_val) {
     return REDISMODULE_OK;
 }
 
+/* Opens <keyname> for writing after passive expiry has run on it. In scan mode passive
+ * expiry concerns only this key and needs a key open of its own, so it runs (and the key
+ * is opened again) only when the hash has expiring fields, which the open key tells for
+ * free; the other modes expire db-wide and always run it first. */
+static RedisModuleKey *openKeyAfterPassiveExpire(RedisModuleCtx *ctx, int dbid, RedisModuleString *keyname) {
+#if !defined(SORT_MODE) && !defined(SLAB_MODE)
+    RedisModuleKey *key = RedisModule_OpenKey(ctx, keyname, REDISMODULE_READ | REDISMODULE_WRITE);
+    if (RedisModule_KeyType(key) != REDISMODULE_KEYTYPE_MODULE || RedisModule_ModuleTypeGetType(key) != TairHashType ||
+        TAIRHASH_EXPIRE_INDEX_LEN((tairHashObj *)RedisModule_ModuleTypeGetValue(key)) == 0) {
+        return key;
+    }
+    RedisModule_CloseKey(key);
+#endif
+    g_expire_algorithm.passiveExpire(ctx, dbid, keyname);
+    return RedisModule_OpenKey(ctx, keyname, REDISMODULE_READ | REDISMODULE_WRITE);
+}
+
 /* ========================= "tairhash" type commands ======================= */
 
 /* EXHSET <key> <field> <value> [EX time] [EXAT time] [PX time] [PXAT time] [NX|XX] [VER version | ABS version] [KEEPTTL] */
@@ -861,9 +878,7 @@ int TairHashTypeHset_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv,
     int ex_flags = TAIR_HASH_SET_NO_FLAGS;
     int nokey = 0;
 
-    g_expire_algorithm.passiveExpire(ctx, RedisModule_GetSelectedDb(ctx), argv[1]);
-
-    RedisModuleKey *key = RedisModule_OpenKey(ctx, argv[1], REDISMODULE_READ | REDISMODULE_WRITE);
+    RedisModuleKey *key = openKeyAfterPassiveExpire(ctx, RedisModule_GetSelectedDb(ctx), argv[1]);
     int type = RedisModule_KeyType(key);
     if (REDISMODULE_KEYTYPE_EMPTY != type && RedisModule_ModuleTypeGetType(key) != TairHashType) {
         RedisModule_ReplyWithError(ctx, REDISMODULE_ERRORMSG_WRONGTYPE);
@@ -1045,9 +1060,7 @@ int TairHashTypeHsetNx_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **arg
      * (ISB on arm64, lfence/rdtscp on x86), stalling on any cache miss still in flight. */
     long long now = seqClockNow();
 
-    g_expire_algorithm.passiveExpire(ctx, RedisModule_GetSelectedDb(ctx), argv[1]);
-
-    RedisModuleKey *key = RedisModule_OpenKey(ctx, argv[1], REDISMODULE_READ | REDISMODULE_WRITE);
+    RedisModuleKey *key = openKeyAfterPassiveExpire(ctx, RedisModule_GetSelectedDb(ctx), argv[1]);
     int type = RedisModule_KeyType(key);
     if (REDISMODULE_KEYTYPE_EMPTY != type && RedisModule_ModuleTypeGetType(key) != TairHashType) {
         RedisModule_ReplyWithError(ctx, REDISMODULE_ERRORMSG_WRONGTYPE);
@@ -1097,10 +1110,8 @@ int TairHashTypeHmset_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv
      * (ISB on arm64, lfence/rdtscp on x86), stalling on any cache miss still in flight. */
     long long now = seqClockNow();
 
-    g_expire_algorithm.passiveExpire(ctx, RedisModule_GetSelectedDb(ctx), argv[1]);
-
     int nokey;
-    RedisModuleKey *key = RedisModule_OpenKey(ctx, argv[1], REDISMODULE_READ | REDISMODULE_WRITE);
+    RedisModuleKey *key = openKeyAfterPassiveExpire(ctx, RedisModule_GetSelectedDb(ctx), argv[1]);
     int type = RedisModule_KeyType(key);
     if (REDISMODULE_KEYTYPE_EMPTY != type && RedisModule_ModuleTypeGetType(key) != TairHashType) {
         RedisModule_ReplyWithError(ctx, REDISMODULE_ERRORMSG_WRONGTYPE);
@@ -1158,9 +1169,7 @@ int TairHashTypeHmsetWithOpts_RedisCommand(RedisModuleCtx *ctx, RedisModuleStrin
      * (ISB on arm64, lfence/rdtscp on x86), stalling on any cache miss still in flight. */
     long long now = seqClockNow();
 
-    g_expire_algorithm.passiveExpire(ctx, RedisModule_GetSelectedDb(ctx), argv[1]);
-
-    RedisModuleKey *key = RedisModule_OpenKey(ctx, argv[1], REDISMODULE_READ | REDISMODULE_WRITE);
+    RedisModuleKey *key = openKeyAfterPassiveExpire(ctx, RedisModule_GetSelectedDb(ctx), argv[1]);
     int type = RedisModule_KeyType(key);
     if (REDISMODULE_KEYTYPE_EMPTY != type && RedisModule_ModuleTypeGetType(key) != TairHashType) {
         RedisModule_ReplyWithError(ctx, REDISMODULE_ERRORMSG_WRONGTYPE);
@@ -1403,9 +1412,7 @@ int TairHashTypeHsetVer_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **ar
         return REDISMODULE_ERR;
     }
 
-    g_expire_algorithm.passiveExpire(ctx, RedisModule_GetSelectedDb(ctx), argv[1]);
-
-    RedisModuleKey *key = RedisModule_OpenKey(ctx, argv[1], REDISMODULE_READ | REDISMODULE_WRITE);
+    RedisModuleKey *key = openKeyAfterPassiveExpire(ctx, RedisModule_GetSelectedDb(ctx), argv[1]);
     int type = RedisModule_KeyType(key);
     if (REDISMODULE_KEYTYPE_EMPTY != type && RedisModule_ModuleTypeGetType(key) != TairHashType) {
         RedisModule_ReplyWithError(ctx, REDISMODULE_ERRORMSG_WRONGTYPE);
@@ -1463,9 +1470,7 @@ int TairHashTypeHincrBy_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **ar
     int ex_flags = TAIR_HASH_SET_NO_FLAGS;
     int nokey;
 
-    g_expire_algorithm.passiveExpire(ctx, RedisModule_GetSelectedDb(ctx), argv[1]);
-
-    RedisModuleKey *key = RedisModule_OpenKey(ctx, argv[1], REDISMODULE_READ | REDISMODULE_WRITE);
+    RedisModuleKey *key = openKeyAfterPassiveExpire(ctx, RedisModule_GetSelectedDb(ctx), argv[1]);
     int type = RedisModule_KeyType(key);
     if (REDISMODULE_KEYTYPE_EMPTY != type && RedisModule_ModuleTypeGetType(key) != TairHashType) {
         RedisModule_ReplyWithError(ctx, REDISMODULE_ERRORMSG_WRONGTYPE);
@@ -1690,9 +1695,7 @@ int TairHashTypeHincrByFloat_RedisCommand(RedisModuleCtx *ctx, RedisModuleString
     int ex_flags = TAIR_HASH_SET_NO_FLAGS;
     int nokey = 0;
 
-    g_expire_algorithm.passiveExpire(ctx, RedisModule_GetSelectedDb(ctx), argv[1]);
-
-    RedisModuleKey *key = RedisModule_OpenKey(ctx, argv[1], REDISMODULE_READ | REDISMODULE_WRITE);
+    RedisModuleKey *key = openKeyAfterPassiveExpire(ctx, RedisModule_GetSelectedDb(ctx), argv[1]);
     int type = RedisModule_KeyType(key);
     if (REDISMODULE_KEYTYPE_EMPTY != type && RedisModule_ModuleTypeGetType(key) != TairHashType) {
         RedisModule_ReplyWithError(ctx, REDISMODULE_ERRORMSG_WRONGTYPE);
@@ -2964,9 +2967,7 @@ int TairHashTypeHmsetLww_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **a
     }
 
     int dbid = RedisModule_GetSelectedDb(ctx);
-    g_expire_algorithm.passiveExpire(ctx, dbid, argv[1]);
-
-    RedisModuleKey *key = RedisModule_OpenKey(ctx, argv[1], REDISMODULE_READ | REDISMODULE_WRITE);
+    RedisModuleKey *key = openKeyAfterPassiveExpire(ctx, dbid, argv[1]);
     tairHashObj *o = getOrCreateTairHash(ctx, key, argv[1]);
     if (o == NULL) {
         return REDISMODULE_ERR;
@@ -3105,9 +3106,7 @@ int TairHashTypeSync_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv,
     }
 
     int dbid = RedisModule_GetSelectedDb(ctx);
-    g_expire_algorithm.passiveExpire(ctx, dbid, argv[1]);
-
-    RedisModuleKey *key = RedisModule_OpenKey(ctx, argv[1], REDISMODULE_READ | REDISMODULE_WRITE);
+    RedisModuleKey *key = openKeyAfterPassiveExpire(ctx, dbid, argv[1]);
     tairHashObj *o = getOrCreateTairHash(ctx, key, argv[1]);
     if (o == NULL) {
         return REDISMODULE_ERR;
