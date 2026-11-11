@@ -35,6 +35,7 @@ type Result struct {
 	Label       string    `json:"label"`
 	Run         string    `json:"run"`
 	Backend     string    `json:"backend"`
+	BackendType string    `json:"backend_type"`
 	Workload    string    `json:"workload"`
 	Concurrency int       `json:"concurrency"`
 	Repeat      int       `json:"repeat"`
@@ -56,6 +57,7 @@ type Result struct {
 	Latency    Latency `json:"latency"`
 
 	Server        ServerMetrics  `json:"server_metrics"`
+	Interference  Interference   `json:"interference"`
 	ServerProfile *ServerProfile `json:"server_profile,omitempty"`
 	ClientProfile string         `json:"client_profile,omitempty"`
 	Artifacts     string         `json:"artifacts,omitempty"`
@@ -74,6 +76,7 @@ func newResult(b Backend, wl Workload, ks *Keyspace, cfg RunConfig, lr loadResul
 		Label:       cfg.Label,
 		Run:         RunID(b.Name, wl.Name, cfg.Concurrency, cfg.Repeat, cfg.Profiled),
 		Backend:     b.Name,
+		BackendType: b.Type,
 		Workload:    wl.Name,
 		Concurrency: cfg.Concurrency,
 		Repeat:      cfg.Repeat,

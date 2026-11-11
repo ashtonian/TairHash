@@ -1,6 +1,8 @@
 package bench
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -98,7 +100,7 @@ func TestReportExcludesProfiledRuns(t *testing.T) {
 		{Workload: "get", Concurrency: 16, Backend: "lua", OpsPerSec: 1, Profiled: true, Server: ServerMetrics{BusyUsPerOp: 99}},
 	}
 	var out strings.Builder
-	require.NoError(t, Report(&out, loads, nil))
+	require.NoError(t, Report(&out, loads, nil, ReportOptions{}))
 	assert.Contains(t, out.String(), "| 16 | lua | 1 | 50 (±0%) |")
 	assert.Contains(t, out.String(), "| 16 | lua | 5.00 | 2.50x (±0%) |")
 }
@@ -115,9 +117,9 @@ func TestPairedRatioCancelsDriftBetweenRepeats(t *testing.T) {
 	// Repeat 1 ran on a loaded host. Per-repeat ratios are 0.5, 0.5, 0.75; a
 	// ratio of medians would report 50/80 = 0.62.
 	module, lua := runs(100, 50, 80), runs(50, 25, 60)
-	assert.Equal(t, "0.50x (±25%)", pairedRatio(lua, module, ops))
-	assert.Equal(t, "—", pairedRatio(lua, nil, ops))
-	assert.Equal(t, "—", pairedRatio(runs(), module, ops))
+	assert.Equal(t, "0.50x (±25%)", formatPairedRatio(lua, module, ops))
+	assert.Equal(t, "—", formatPairedRatio(lua, nil, ops))
+	assert.Equal(t, "—", formatPairedRatio(runs(), module, ops))
 }
 
 func TestReportKeepsLabelsApart(t *testing.T) {
@@ -126,7 +128,7 @@ func TestReportKeepsLabelsApart(t *testing.T) {
 		{Label: "build-b", Workload: "get", Concurrency: 1, Backend: "module", OpsPerSec: 300},
 	}
 	var out strings.Builder
-	require.NoError(t, Report(&out, loads, nil))
+	require.NoError(t, Report(&out, loads, nil, ReportOptions{}))
 	assert.Contains(t, out.String(), "\n# build-a\n")
 	assert.Contains(t, out.String(), "\n# build-b\n")
 	assert.Contains(t, out.String(), "| 1 | module | 1 | 100 (±0%) |")
@@ -168,4 +170,151 @@ func TestReclaimWorkExcludesHarnessAndIdle(t *testing.T) {
 	m := ServerMetrics{WindowSec: 20, BusyMainSec: 0.142, HarnessSec: 0.002}
 	assert.InDelta(t, 1.0, reclaimWorkUsPerField(m, 0.006, 20000), 1e-9)
 	assert.Equal(t, 0.0, reclaimWorkUsPerField(m, 0.006, 0))
+}
+
+func TestParseBackendSpecs(t *testing.T) {
+	tests := []struct {
+		name    string
+		list    string
+		want    []BackendSpec
+		wantErr string
+	}{
+		{"types name themselves", "module, lua,native", []BackendSpec{
+			{Name: "module", Type: "module"}, {Name: "lua", Type: "lua"}, {Name: "native", Type: "native"},
+		}, ""},
+		{"named builds of one type", "develop=module@127.0.0.1:26380,lazy-index=module@127.0.0.1:26381,lua@127.0.0.1:26379", []BackendSpec{
+			{Name: "develop", Type: "module", Addr: "127.0.0.1:26380"},
+			{Name: "lazy-index", Type: "module", Addr: "127.0.0.1:26381"},
+			{Name: "lua", Type: "lua", Addr: "127.0.0.1:26379"},
+		}, ""},
+		{"duplicate name", "module@a:1,module@b:2", nil, "name given twice"},
+		{"unknown type", "x=redis", nil, "unknown type"},
+		{"unsafe name", "a/b=module", nil, "must match"},
+		{"upper-case name", "Dev=module", nil, "must match"},
+		{"empty address", "module@", nil, "empty address"},
+		{"empty list", " , ", nil, "no backends"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseBackendSpecs(tt.list)
+			if tt.wantErr != "" {
+				assert.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestResolveReference(t *testing.T) {
+	assert.Equal(t, "develop", resolveReference("develop", []string{"lua", "develop", "module"}))
+	assert.Equal(t, "module", resolveReference("absent", []string{"lua", "module"}))
+	assert.Equal(t, "lua", resolveReference("", []string{"lua", "native"}))
+	assert.Equal(t, "", resolveReference("", nil))
+}
+
+func TestReportComparesNamedBuildsAgainstReference(t *testing.T) {
+	run := func(backend string, repeat int, busy, ops, foreign float64) Result {
+		return Result{
+			Workload: "get", Concurrency: 128, Backend: backend, BackendType: "module", Repeat: repeat, OpsPerSec: ops,
+			Server: ServerMetrics{BusyUsPerOp: busy}, Interference: Interference{WindowSec: 10, ForeignCores: foreign},
+		}
+	}
+	// Run order, not name order, sets the row order: develop, lazy, lua.
+	loads := []Result{
+		run("develop", 0, 2, 100e3, 0), run("lazy", 0, 1, 200e3, 0), run("lua", 0, 4, 50e3, 0),
+		run("develop", 1, 2, 100e3, 0), run("lazy", 1, 1, 200e3, 2.5), run("lua", 1, 4, 50e3, 0),
+	}
+	var out strings.Builder
+	require.NoError(t, Report(&out, loads, nil, ReportOptions{Reference: "develop"}))
+	text := out.String()
+	assert.Contains(t, text, "## summary — every backend against develop")
+	assert.Contains(t, text, "| develop | 2.00 |\n| lazy | 1.00 (0.50x) † |\n| lua | 4.00 (2.00x) |")
+	assert.Contains(t, text, "| lazy | 200k (2.00x) † |")
+	assert.Contains(t, text, "ops/s vs develop (paired)")
+	assert.Contains(t, text, "| 128 | lazy | 1.00 | 0.50x (±0%) |")
+	assert.Contains(t, text, "1 of 6 windows above 1 core")
+}
+
+func TestForeignCPU(t *testing.T) {
+	const self, server = 100, 200
+	start := map[int]procStat{
+		self:   {ppid: 1, cpu: 50, name: "thbench"},
+		server: {ppid: 1, cpu: 900, name: "valkey-server"},
+		300:    {ppid: 1, cpu: 10, name: "docker"},
+		400:    {ppid: 1, cpu: 5, name: "old"},
+		500:    {ppid: 1, cpu: 7, name: "idle"},
+	}
+	end := map[int]procStat{
+		self:   {ppid: 1, cpu: 80, name: "thbench"},
+		server: {ppid: 1, cpu: 910, name: "valkey-server"},
+		300:    {ppid: 1, cpu: 12.5, name: "docker"}, // 2.5s in the window
+		400:    {ppid: 1, cpu: 0.5, name: "reused"},  // pid reused: all 0.5s count
+		500:    {ppid: 1, cpu: 7, name: "idle"},      // nothing used
+		600:    {ppid: 1, cpu: 1, name: "compiler"},  // started inside the window
+		700:    {ppid: self, cpu: 0.2, name: "ps"},   // our own child
+	}
+	in := foreignCPU(start, end, map[int]bool{self: true, server: true}, self, 5*time.Second)
+	assert.InDelta(t, 4.0, in.ForeignCPUSec, 1e-9)
+	assert.InDelta(t, 0.8, in.ForeignCores, 1e-9)
+	require.Len(t, in.Top, 3)
+	assert.Equal(t, ProcessCPU{PID: 300, Name: "docker", CPUSec: 2.5}, in.Top[0])
+	assert.Equal(t, "compiler", in.Top[1].Name)
+}
+
+func TestParseCPUTime(t *testing.T) {
+	tests := []struct {
+		in   string
+		want float64
+	}{
+		{"0:00.12", 0.12},
+		{"527:12.79", 527*60 + 12.79},
+		{"1:02:03", 3723},
+		{"2-01:00:00", 2*86400 + 3600},
+	}
+	for _, tt := range tests {
+		got, err := parseCPUTime(tt.in)
+		require.NoError(t, err, tt.in)
+		assert.InDelta(t, tt.want, got, 1e-9, tt.in)
+	}
+	_, err := parseCPUTime("1:xx")
+	assert.Error(t, err)
+}
+
+func TestParsePS(t *testing.T) {
+	out := "    1     0 145:40.47 /sbin/launchd\n  659     1  0:01.50 /Applications/Some App.app/Contents/MacOS/Some App\n"
+	procs, err := parsePS([]byte(out))
+	require.NoError(t, err)
+	assert.Equal(t, procStat{ppid: 1, cpu: 1.5, name: "Some App"}, procs[659])
+	assert.InDelta(t, 145*60+40.47, procs[1].cpu, 1e-9)
+
+	_, err = parsePS([]byte("abc 1 0:01.00 x\n"))
+	assert.Error(t, err)
+}
+
+func TestParseProcStat(t *testing.T) {
+	st, ok := parseProcStat([]byte("1234 (my (odd) proc) S 77 1234 1234 0 -1 4194304 100 0 0 0 250 50 0 0 20 0 1 0"))
+	require.True(t, ok)
+	assert.Equal(t, procStat{ppid: 77, cpu: 3, name: "my (odd) proc"}, st)
+	_, ok = parseProcStat([]byte("1234 (short) S 1"))
+	assert.False(t, ok)
+}
+
+func TestReadSourceRevision(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		p := filepath.Join(dir, name)
+		require.NoError(t, os.WriteFile(p, []byte(content), 0o644))
+		return p
+	}
+	rev, err := readSourceRevision(write("clean", "7623ee5abc\n"))
+	require.NoError(t, err)
+	assert.Equal(t, "7623ee5abc", rev)
+	rev, err = readSourceRevision(write("dirty", "7623ee5abc\n M src/tairhash.c\n"))
+	require.NoError(t, err)
+	assert.Equal(t, "7623ee5abc+dirty", rev)
+	rev, err = readSourceRevision(filepath.Join(dir, "absent"))
+	require.NoError(t, err)
+	assert.Equal(t, "", rev)
 }

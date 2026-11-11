@@ -2,6 +2,7 @@ package bench
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -36,6 +37,13 @@ type ReclaimConfig struct {
 	ArtifactsDir     string
 	// Placement is recorded in HostFacts.
 	Placement string
+	// Profiled runs capture a server profile of ProfileWindow from the opening
+	// of the reclaim window (a slow reclaimer's steady state, a fast one's
+	// whole reclamation). Profilers perturb timing, so profiled runs are
+	// reported for their profiles only.
+	Profiled       bool
+	ServerProfiler *Profiler
+	ProfileWindow  time.Duration
 }
 
 // reclaimWindowLead is how long before the deadline the reclaim window opens.
@@ -102,14 +110,17 @@ type ReclaimSample struct {
 
 // ReclaimResult is the outcome of one reclaim scenario.
 type ReclaimResult struct {
-	Kind      string    `json:"kind"`
-	Time      time.Time `json:"time"`
-	Label     string    `json:"label"`
-	Backend   string    `json:"backend"`
-	Keys      int       `json:"keys"`
-	Fields    int       `json:"fields_per_key"`
-	ValueSize int       `json:"value_size"`
-	Lease     string    `json:"lease"`
+	Kind        string    `json:"kind"`
+	Time        time.Time `json:"time"`
+	Label       string    `json:"label"`
+	Backend     string    `json:"backend"`
+	BackendType string    `json:"backend_type"`
+	// Profiled runs exist for their profiles; their timings are perturbed.
+	Profiled  bool   `json:"profiled"`
+	Keys      int    `json:"keys"`
+	Fields    int    `json:"fields_per_key"`
+	ValueSize int    `json:"value_size"`
+	Lease     string `json:"lease"`
 
 	LoadSec float64 `json:"load_sec"`
 	// BytesPerField is used_memory growth per loaded field, including the
@@ -133,6 +144,8 @@ type ReclaimResult struct {
 	// was gone (or the timeout), including client-driven sweeping, net of the
 	// harness's own polling; per-op figures are per field reclaimed.
 	Server ServerMetrics `json:"server_metrics"`
+	// Interference is other processes' CPU over the same window.
+	Interference Interference `json:"interference"`
 	// IdleBusyPerSec is main-thread busy seconds per second on the empty
 	// server, net of harness commands, measured over IdleWindow before loading.
 	IdleBusyPerSec float64 `json:"idle_busy_per_sec"`
@@ -143,6 +156,8 @@ type ReclaimResult struct {
 	SweptFields    int64           `json:"swept_fields,omitempty"`
 	Timeline       []ReclaimSample `json:"timeline"`
 	Artifacts      string          `json:"artifacts,omitempty"`
+	ServerProfile  *ServerProfile  `json:"server_profile,omitempty"`
+	ClientProfile  string          `json:"client_profile,omitempty"`
 
 	ServerFacts Facts     `json:"server"`
 	Host        HostFacts `json:"host"`
@@ -151,10 +166,17 @@ type ReclaimResult struct {
 // Reclaim runs the expiry scenario for one backend.
 func Reclaim(ctx context.Context, srv *Server, b Backend, ks *Keyspace, cfg ReclaimConfig) (ReclaimResult, error) {
 	res := ReclaimResult{
-		Kind: "reclaim", Label: cfg.Label, Backend: b.Name,
+		Kind: "reclaim", Label: cfg.Label, Backend: b.Name, BackendType: b.Type, Profiled: cfg.Profiled,
 		Keys: ks.Keys, Fields: ks.Fields, ValueSize: ks.ValueSize, Lease: cfg.Lease.String(),
 	}
-	art, err := newArtifacts(cfg.ArtifactsDir, cfg.Label, "reclaim-"+b.Name)
+	run := "reclaim-" + b.Name
+	if cfg.Profiled {
+		if cfg.ArtifactsDir == "" {
+			return res, errors.New("profiled reclaim runs need an artifacts directory")
+		}
+		run += "-profile"
+	}
+	art, err := newArtifacts(cfg.ArtifactsDir, cfg.Label, run)
 	if err != nil {
 		return res, err
 	}
@@ -225,10 +247,30 @@ func Reclaim(ctx context.Context, srv *Server, b Backend, ks *Keyspace, cfg Recl
 	if err := srv.ResetDiagnostics(ctx); err != nil {
 		return res, err
 	}
+	watch, err := startCPUWatch(ctx, res.ServerFacts.ProcessID)
+	if err != nil {
+		return res, err
+	}
 	atDeadline, err := srv.Snapshot(ctx)
 	if err != nil {
 		return res, err
 	}
+	prof, err := startProfiles(ctx, cfg.Profiled, cfg.ServerProfiler, cfg.ProfileWindow, art, res.ServerFacts.ProcessID)
+	if err != nil {
+		return res, err
+	}
+	// Every return from here waits for the profilers; stopProfiles is
+	// idempotent so the success path can wait before reading the capture.
+	var profErr error
+	profStopped := false
+	stopProfiles := func() error {
+		if !profStopped {
+			profStopped = true
+			profErr = prof.stop()
+		}
+		return profErr
+	}
+	defer func() { _ = stopProfiles() }()
 	if late := time.Since(deadline); late > 0 {
 		return res, fmt.Errorf("reclaim window opened %s after the deadline, so it misses reclamation work; raise -lease", late)
 	}
@@ -269,6 +311,13 @@ func Reclaim(ctx context.Context, srv *Server, b Backend, ks *Keyspace, cfg Recl
 	}
 
 	limit := time.Now().Add(cfg.Timeout)
+	if cfg.Profiled {
+		// A profiled run is kept for its profile alone, so it stops polling when
+		// the profile ends rather than waiting out a slow reclaimer.
+		if end := deadline.Add(cfg.ProfileWindow - reclaimWindowLead); end.Before(limit) {
+			limit = end
+		}
+	}
 	poll := time.NewTicker(cfg.Poll)
 	defer poll.Stop()
 	prev, err := srv.quickStats(ctx)
@@ -322,6 +371,16 @@ func Reclaim(ctx context.Context, srv *Server, b Backend, ks *Keyspace, cfg Recl
 	if err != nil {
 		return res, err
 	}
+	if res.Interference, err = watch.stop(ctx); err != nil {
+		return res, err
+	}
+	if err := stopProfiles(); err != nil {
+		return res, err
+	}
+	res.ClientProfile = prof.clientPath
+	if res.ServerProfile, err = prof.convertServer(ctx, cfg.ServerProfiler, art, res.ServerFacts.ProcessID); err != nil {
+		return res, err
+	}
 	reclaimed := fields
 	if !res.Reclaimed && res.LoadedKeys > 0 {
 		// Keys disappear only once all their fields are gone, so this is a
@@ -357,7 +416,12 @@ func Reclaim(ctx context.Context, srv *Server, b Backend, ks *Keyspace, cfg Recl
 	if err := writeJSONLines(art, "timeline.jsonl", res.Timeline); err != nil {
 		return res, err
 	}
-	return res, art.writeJSON("result.json", res)
+	if err := art.writeJSON("result.json", res); err != nil {
+		return res, err
+	}
+	// An unfinished reclamation leaves data behind for the module timer to scan
+	// while other backends run.
+	return res, srv.Flush(ctx)
 }
 
 // sampleMemoryUsage measures MEMORY USAGE for up to n logical keys spread over

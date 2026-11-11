@@ -215,13 +215,19 @@ func Run(ctx context.Context, srv *Server, b Backend, wl Workload, ks *Keyspace,
 	if err := srv.ResetDiagnostics(ctx); err != nil {
 		return Result{}, err
 	}
+	// The process watch brackets the server snapshots, so it covers the whole
+	// server window without its own sampling time landing inside it.
+	watch, err := startCPUWatch(ctx, facts.ProcessID)
+	if err != nil {
+		return Result{}, err
+	}
 	before, err := srv.Snapshot(ctx)
 	if err != nil {
 		return Result{}, err
 	}
 	load1, _ := loadAverage()
 
-	prof, err := startProfiles(ctx, cfg, art, facts.ProcessID)
+	prof, err := startProfiles(ctx, cfg.Profiled, cfg.ServerProfiler, cfg.Duration, art, facts.ProcessID)
 	if err != nil {
 		return Result{}, err
 	}
@@ -230,6 +236,10 @@ func Run(ctx context.Context, srv *Server, b Backend, wl Workload, ks *Keyspace,
 	samples, sampleErr := timeline.stop()
 	// Snapshot before waiting on the profiler, which may outlive the window.
 	after, err := srv.Snapshot(ctx)
+	if err != nil {
+		return Result{}, err
+	}
+	interference, err := watch.stop(ctx)
 	if err != nil {
 		return Result{}, err
 	}
@@ -254,14 +264,11 @@ func Run(ctx context.Context, srv *Server, b Backend, wl Workload, ks *Keyspace,
 	metrics.Timeline = timelineStats(samples)
 
 	res := newResult(b, wl, ks, cfg, lr, metrics, facts, [2]float64{load1, load2})
+	res.Interference = interference
 	res.Artifacts = art.dir
 	res.ClientProfile = prof.clientPath
-	if prof.serverRaw != "" {
-		sum, outs, err := serverprof.Convert(ctx, cfg.ServerProfiler.Format, prof.serverRaw, facts.ProcessID, cfg.ServerProfiler.Period, art.path("server"), 30)
-		if err != nil {
-			return Result{}, fmt.Errorf("convert server profile: %w", err)
-		}
-		res.ServerProfile = &ServerProfile{Raw: prof.serverRaw, Outputs: outs, Summary: sum}
+	if res.ServerProfile, err = prof.convertServer(ctx, cfg.ServerProfiler, art, facts.ProcessID); err != nil {
+		return Result{}, err
 	}
 
 	for name, content := range map[string]string{
@@ -281,6 +288,11 @@ func Run(ctx context.Context, srv *Server, b Backend, wl Workload, ks *Keyspace,
 		return Result{}, err
 	}
 	if err := art.writeJSON("result.json", res); err != nil {
+		return Result{}, err
+	}
+	// Leave the server empty: while other backends run, a loaded module keeps
+	// scanning its data from the active-expire timer.
+	if err := srv.Flush(ctx); err != nil {
 		return Result{}, err
 	}
 	return res, nil
@@ -327,9 +339,24 @@ type profiles struct {
 	stop       func() error
 }
 
-func startProfiles(ctx context.Context, cfg RunConfig, art artifacts, pid int) (profiles, error) {
+// convertServer turns the raw server capture into pprof and a phase summary;
+// it returns nil when no server profile was taken.
+func (p profiles) convertServer(ctx context.Context, prof *Profiler, art artifacts, pid int) (*ServerProfile, error) {
+	if p.serverRaw == "" {
+		return nil, nil
+	}
+	sum, outs, err := serverprof.Convert(ctx, prof.Format, p.serverRaw, pid, prof.Period, art.path("server"), 30)
+	if err != nil {
+		return nil, fmt.Errorf("convert server profile: %w", err)
+	}
+	return &ServerProfile{Raw: p.serverRaw, Outputs: outs, Summary: sum}, nil
+}
+
+// startProfiles starts the client CPU profile and, with prof, a server profile
+// of d when profiled is set; otherwise it does nothing.
+func startProfiles(ctx context.Context, profiled bool, prof *Profiler, d time.Duration, art artifacts, pid int) (profiles, error) {
 	p := profiles{stop: func() error { return nil }}
-	if !cfg.Profiled {
+	if !profiled {
 		return p, nil
 	}
 	if !art.enabled() {
@@ -345,9 +372,9 @@ func startProfiles(ctx context.Context, cfg RunConfig, art artifacts, pid int) (
 		return p, fmt.Errorf("start client profile: %w", err)
 	}
 	var waitServer func() error
-	if cfg.ServerProfiler != nil && pid > 0 {
-		p.serverRaw = art.path(cfg.ServerProfiler.rawName())
-		if waitServer, err = cfg.ServerProfiler.Start(ctx, pid, cfg.Duration, p.serverRaw); err != nil {
+	if prof != nil && pid > 0 {
+		p.serverRaw = art.path(prof.rawName())
+		if waitServer, err = prof.Start(ctx, pid, d, p.serverRaw); err != nil {
 			pprof.StopCPUProfile()
 			f.Close()
 			return p, err

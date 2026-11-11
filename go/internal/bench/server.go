@@ -3,7 +3,11 @@ package bench
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -47,6 +51,7 @@ func (s *Server) hasTairHash(ctx context.Context) (bool, error) {
 
 type moduleInfo struct {
 	name string
+	path string
 	args []string
 }
 
@@ -64,6 +69,9 @@ func (s *Server) moduleList(ctx context.Context) ([]moduleInfo, error) {
 		nameMsg := entry["name"]
 		var mi moduleInfo
 		mi.name, _ = nameMsg.ToString()
+		if p, ok := entry["path"]; ok {
+			mi.path, _ = p.ToString()
+		}
 		if a, ok := entry["args"]; ok {
 			mi.args, _ = a.AsStrSlice()
 		}
@@ -187,15 +195,19 @@ func (s Snapshot) errorStats() map[string]int64 {
 
 // Facts describes the server a run measured, for the result record.
 type Facts struct {
-	ValkeyVersion  string            `json:"valkey_version"`
-	ProcessID      int               `json:"process_id"`
-	Multiplexing   string            `json:"multiplexing_api"`
-	Allocator      string            `json:"mem_allocator"`
-	Modules        []string          `json:"modules"`
-	ModuleExpire   map[string]string `json:"tairhash_active_expire,omitempty"`
-	Config         map[string]string `json:"config"`
-	Executable     string            `json:"executable"`
-	IOThreadsAlive string            `json:"io_threads_active"`
+	ValkeyVersion string   `json:"valkey_version"`
+	ProcessID     int      `json:"process_id"`
+	Multiplexing  string   `json:"multiplexing_api"`
+	Allocator     string   `json:"mem_allocator"`
+	Modules       []string `json:"modules"`
+	// TairHashRevision is the source revision the loaded module was built from,
+	// read from the source-revision file `make module` writes beside it; empty
+	// when the module is absent or was built elsewhere.
+	TairHashRevision string            `json:"tairhash_revision,omitempty"`
+	ModuleExpire     map[string]string `json:"tairhash_active_expire,omitempty"`
+	Config           map[string]string `json:"config"`
+	Executable       string            `json:"executable"`
+	IOThreadsAlive   string            `json:"io_threads_active"`
 }
 
 // factConfig lists the tunables recorded with every result because they change
@@ -237,6 +249,11 @@ func (s *Server) Facts(ctx context.Context) (Facts, error) {
 	}
 	for _, m := range mods {
 		f.Modules = append(f.Modules, strings.TrimSpace(m.name+" "+strings.Join(m.args, " ")))
+		if m.name == "tairhash" && m.path != "" {
+			if f.TairHashRevision, err = readSourceRevision(filepath.Join(filepath.Dir(m.path), "source-revision")); err != nil {
+				return Facts{}, err
+			}
+		}
 	}
 	for _, param := range factConfig {
 		kv, err := s.vk.Do(ctx, s.vk.B().ConfigGet().Parameter(param).Build()).AsStrMap()
@@ -259,6 +276,25 @@ func (s *Server) Facts(ctx context.Context) (Facts, error) {
 		}
 	}
 	return f, nil
+}
+
+// readSourceRevision reads a source-revision file: the commit on its first line,
+// then one `git status --porcelain` line per uncommitted change. It returns the
+// commit, suffixed "+dirty" when changes were listed, or "" when the file is absent.
+func readSourceRevision(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read module source revision: %w", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	rev := strings.TrimSpace(lines[0])
+	if len(lines) > 1 {
+		rev += "+dirty"
+	}
+	return rev, nil
 }
 
 // ConfigDump returns CONFIG GET * as sorted "name value" lines.

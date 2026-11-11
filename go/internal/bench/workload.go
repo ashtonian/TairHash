@@ -17,7 +17,12 @@ import (
 
 // Backend is one implementation under test.
 type Backend struct {
-	Name  string
+	// Name identifies the backend in results and artifact paths; it is unique
+	// within a run and path-safe. Several backends may share a Type, such as
+	// module builds of different revisions.
+	Name string
+	// Type is the implementation: module, lua or native.
+	Type  string
 	Store fieldhash.Store
 	// Versioned is nil when the backend has no per-field versions.
 	Versioned fieldhash.VersionedStore

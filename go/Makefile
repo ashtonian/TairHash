@@ -2,6 +2,7 @@
 #
 #   make valkey          build the pinned Valkey into .cache (VALKEY_MALLOC=jemalloc|libc)
 #   make module          build the TairHash module (MODULE_MODE=scan|sort|slab) from MODULE_SRC
+#                        into .cache/modules/MODULE_NAME-MODULE_MODE
 #   make test            unit tests only (no server)
 #   make test-integration  start a throwaway server with the module and run every test
 #   make bench OUT=dir   full benchmark (see scripts/bench.sh)
@@ -19,11 +20,13 @@ VALKEY_CLI     := $(VALKEY_DIR)/src/valkey-cli
 VALKEY_MALLOC  ?= jemalloc
 VALKEY_STAMP   := $(VALKEY_DIR)/.thbench-malloc-$(VALKEY_MALLOC)
 
-# TairHash source tree the module is built from. Point this at another checkout
-# to benchmark a different module revision.
+# TairHash source tree the module is built from, and the name its build is kept
+# under, so builds of several revisions live side by side (scripts/ladder.sh).
 MODULE_SRC  ?= ..
+MODULE_NAME ?= local
 MODULE_MODE ?= scan
-MODULE_DIR  := $(CACHE)/module-$(MODULE_MODE)
+MODULE_JOBS ?= 4
+MODULE_DIR  := $(CACHE)/modules/$(MODULE_NAME)-$(MODULE_MODE)
 MODULE_SO   := $(abspath $(MODULE_DIR))/tairhash_module.so
 # CMake pins a build tree to one source directory, so each MODULE_SRC gets its own.
 MODULE_BUILD := $(MODULE_DIR)/build-$(shell printf %s "$(abspath $(MODULE_SRC))" | cksum | cut -d' ' -f1)
@@ -52,14 +55,22 @@ $(VALKEY_STAMP):
 	touch $@
 
 # The module's CMakeLists writes into $(MODULE_SRC)/lib whatever the mode, so the
-# result is copied to a per-mode path. CMAKE_POLICY_VERSION_MINIMUM lets CMake 4
-# configure trees that still declare cmake_minimum_required(VERSION 3.0). Frame
-# pointers keep server profiles walkable through module frames on every platform.
+# result is copied to the build's own directory, with the commit it came from
+# (source-revision: commit, then `git status --porcelain`) and the exact compiler
+# invocations (compile_commands.json). MODULE_SRC must be the top of a checkout:
+# inside another repository, git would report that repository's commit.
+# CMAKE_POLICY_VERSION_MINIMUM lets CMake 4 configure trees that still declare
+# cmake_minimum_required(VERSION 3.0). Frame pointers keep server profiles
+# walkable through module frames on every platform.
 module:
-	cmake -S $(MODULE_SRC) -B $(MODULE_BUILD) -DCMAKE_BUILD_TYPE=Release \
+	@cd $(MODULE_SRC) && test -z "$$(git rev-parse --show-prefix)" || \
+		{ echo "MODULE_SRC=$(MODULE_SRC) is not the top of a git checkout" >&2; exit 1; }
+	mkdir -p $(MODULE_DIR)
+	cmake -S $(MODULE_SRC) -B $(MODULE_BUILD) -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
 		-DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_C_FLAGS=-fno-omit-frame-pointer $(MODULE_CMAKE_FLAGS)
-	cmake --build $(MODULE_BUILD) -j
+	cmake --build $(MODULE_BUILD) -j $(MODULE_JOBS)
 	cp $(MODULE_SRC)/lib/tairhash_module.so $(MODULE_SO)
+	cp $(MODULE_BUILD)/compile_commands.json $(MODULE_DIR)/compile_commands.json
 	git -C $(MODULE_SRC) rev-parse HEAD > $(MODULE_DIR)/source-revision
 	git -C $(MODULE_SRC) status --porcelain >> $(MODULE_DIR)/source-revision
 
@@ -87,4 +98,4 @@ report:
 	go run ./cmd/thbench report $(OUT)/results.jsonl > $(OUT)/report.md
 
 clean:
-	rm -rf $(CACHE)/module-* $(CACHE)/thbench
+	rm -rf $(CACHE)/modules $(CACHE)/src $(CACHE)/thbench
