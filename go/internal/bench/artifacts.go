@@ -3,6 +3,7 @@ package bench
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,15 +14,49 @@ type artifacts struct {
 	dir string
 }
 
-func newArtifacts(root, label string) (artifacts, error) {
+// newArtifacts creates root/<label dir>/<run>. The label is free text, so it is
+// mapped to one path-safe segment; run is a RunID and already path-safe.
+func newArtifacts(root, label, run string) (artifacts, error) {
 	if root == "" {
 		return artifacts{}, nil
 	}
-	dir := filepath.Join(root, strings.ReplaceAll(label, "/", "_"))
+	dir := filepath.Join(root, run)
+	if label != "" {
+		dir = filepath.Join(root, labelDir(label), run)
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return artifacts{}, fmt.Errorf("create artifacts dir: %w", err)
 	}
 	return artifacts{dir: dir}, nil
+}
+
+// labelDir maps a label to a single path segment of [A-Za-z0-9._@+-]. When that
+// changes the label, a hash of the original is appended so distinct labels
+// never share a directory.
+func labelDir(label string) string {
+	var b strings.Builder
+	dash := false
+	for _, r := range label {
+		ok := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._@+-", r)
+		switch {
+		case ok:
+			b.WriteRune(r)
+			dash = false
+		case !dash:
+			b.WriteByte('-')
+			dash = true
+		}
+	}
+	slug := strings.Trim(b.String(), "-.")
+	if slug == label {
+		return slug
+	}
+	h := fnv.New32a()
+	h.Write([]byte(label))
+	if slug == "" {
+		return fmt.Sprintf("label-%08x", h.Sum32())
+	}
+	return fmt.Sprintf("%s-%08x", slug, h.Sum32())
 }
 
 func (a artifacts) enabled() bool { return a.dir != "" }

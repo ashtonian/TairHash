@@ -25,6 +25,7 @@ var harnessCommands = map[string]bool{
 }
 
 type cell struct {
+	label       string
 	workload    string
 	concurrency int
 	backend     string
@@ -85,16 +86,18 @@ func backendRank(name string) int {
 }
 
 // Report renders results as Markdown: medians across measured repeats per
-// workload, concurrency and backend, the server's own cost and command mix, and
-// the main-thread profile breakdown from the profiled pass.
+// label, workload, concurrency and backend, the server's own cost and command
+// mix, and the main-thread profile breakdown from the profiled pass. Results
+// with different labels (builds, server configs) are never pooled.
 func Report(w io.Writer, loads []Result, reclaims []ReclaimResult) error {
 	var b strings.Builder
 	writeEnvironment(&b, loads, reclaims)
 
 	aggs := map[cell]*aggregate{}
-	var workloads []string
+	var labels []string
+	workloads := map[string][]string{}
 	for _, r := range loads {
-		c := cell{r.Workload, r.Concurrency, r.Backend}
+		c := cell{r.Label, r.Workload, r.Concurrency, r.Backend}
 		a := aggs[c]
 		if a == nil {
 			a = &aggregate{}
@@ -105,51 +108,29 @@ func Report(w io.Writer, loads []Result, reclaims []ReclaimResult) error {
 		} else {
 			a.runs = append(a.runs, r)
 		}
-		if !slices.Contains(workloads, r.Workload) {
-			workloads = append(workloads, r.Workload)
+		if !slices.Contains(labels, r.Label) {
+			labels = append(labels, r.Label)
+		}
+		if !slices.Contains(workloads[r.Label], r.Workload) {
+			workloads[r.Label] = append(workloads[r.Label], r.Workload)
 		}
 	}
 	order := map[string]int{}
 	for i, wl := range Workloads {
 		order[wl.Name] = i
 	}
-	sort.SliceStable(workloads, func(i, j int) bool { return order[workloads[i]] < order[workloads[j]] })
-
-	for _, wl := range workloads {
-		var cells []cell
-		for c := range aggs {
-			if c.workload == wl {
-				cells = append(cells, c)
+	for _, label := range labels {
+		if len(labels) > 1 {
+			name := label
+			if name == "" {
+				name = "(no label)"
 			}
+			fmt.Fprintf(&b, "\n# %s\n", name)
 		}
-		sort.Slice(cells, func(i, j int) bool {
-			if cells[i].concurrency != cells[j].concurrency {
-				return cells[i].concurrency < cells[j].concurrency
-			}
-			return backendRank(cells[i].backend) < backendRank(cells[j].backend)
-		})
-		desc := ""
-		if w, ok := LookupWorkload(wl); ok {
-			desc = " — " + w.Description
-		}
-		fmt.Fprintf(&b, "\n## %s%s\n", wl, desc)
-		writeClientTable(&b, cells, aggs)
-		writeServerTable(&b, cells, aggs)
-		writeCommandTable(&b, cells, aggs)
-		writeProfileTable(&b, cells, aggs)
-		if wl == "cas" {
-			b.WriteString("\nConflicts per successful update (median): ")
-			var parts []string
-			for _, c := range cells {
-				a := aggs[c]
-				parts = append(parts, fmt.Sprintf("%s c=%d %.4f", c.backend, c.concurrency, a.med(func(r Result) float64 {
-					if r.Ops == 0 {
-						return 0
-					}
-					return float64(r.Conflicts) / float64(r.Ops)
-				})))
-			}
-			b.WriteString(strings.Join(parts, "; ") + "\n")
+		wls := workloads[label]
+		sort.SliceStable(wls, func(i, j int) bool { return order[wls[i]] < order[wls[j]] })
+		for _, wl := range wls {
+			writeWorkload(&b, label, wl, aggs)
 		}
 	}
 	writeReclaim(&b, reclaims)
@@ -157,47 +138,98 @@ func Report(w io.Writer, loads []Result, reclaims []ReclaimResult) error {
 	return err
 }
 
-func ratio(a, ref *aggregate, f func(Result) float64) string {
-	if ref == nil || len(ref.runs) == 0 || len(a.runs) == 0 {
+func writeWorkload(b *strings.Builder, label, wl string, aggs map[cell]*aggregate) {
+	var cells []cell
+	for c := range aggs {
+		if c.label == label && c.workload == wl {
+			cells = append(cells, c)
+		}
+	}
+	sort.Slice(cells, func(i, j int) bool {
+		if cells[i].concurrency != cells[j].concurrency {
+			return cells[i].concurrency < cells[j].concurrency
+		}
+		return backendRank(cells[i].backend) < backendRank(cells[j].backend)
+	})
+	desc := ""
+	if w, ok := LookupWorkload(wl); ok {
+		desc = " — " + w.Description
+	}
+	fmt.Fprintf(b, "\n## %s%s\n", wl, desc)
+	writeClientTable(b, cells, aggs)
+	writeServerTable(b, cells, aggs)
+	writeCommandTable(b, cells, aggs)
+	writeProfileTable(b, cells, aggs)
+	if wl == "cas" {
+		b.WriteString("\nConflicts per successful update (median): ")
+		var parts []string
+		for _, c := range cells {
+			a := aggs[c]
+			parts = append(parts, fmt.Sprintf("%s c=%d %.4f", c.backend, c.concurrency, a.med(func(r Result) float64 {
+				if r.Ops == 0 {
+					return 0
+				}
+				return float64(r.Conflicts) / float64(r.Ops)
+			})))
+		}
+		b.WriteString(strings.Join(parts, "; ") + "\n")
+	}
+}
+
+// pairedRatio is the median, over repeats, of a's value divided by ref's in the
+// same repeat, with the spread of those ratios. A cell's backends run back to
+// back within a repeat, so pairing cancels host-load drift between repeats
+// that a ratio of medians would keep.
+func pairedRatio(a, ref *aggregate, f func(Result) float64) string {
+	if ref == nil {
 		return "—"
 	}
-	r := ref.med(f)
-	if r == 0 {
+	refByRepeat := map[int]float64{}
+	for _, r := range ref.runs {
+		refByRepeat[r.Repeat] = f(r)
+	}
+	var xs []float64
+	for _, r := range a.runs {
+		if d, ok := refByRepeat[r.Repeat]; ok && d != 0 {
+			xs = append(xs, f(r)/d)
+		}
+	}
+	if len(xs) == 0 {
 		return "—"
 	}
-	return fmt.Sprintf("%.2fx", a.med(f)/r)
+	return fmt.Sprintf("%.2fx (±%.0f%%)", median(xs), 50*spread(xs))
 }
 
 func writeClientTable(b *strings.Builder, cells []cell, aggs map[cell]*aggregate) {
 	b.WriteString("\n**Client** (median of measured runs)\n\n")
-	b.WriteString("| conc | backend | runs | ops/s (±spread) | p50 µs | p99 µs | p99.9 µs | ops/s vs module |\n")
+	b.WriteString("| conc | backend | runs | ops/s (±spread) | p50 µs | p99 µs | p99.9 µs | ops/s vs module (paired) |\n")
 	b.WriteString("|---:|---|---:|---:|---:|---:|---:|---:|\n")
 	for _, c := range cells {
 		a := aggs[c]
 		if len(a.runs) == 0 {
 			continue
 		}
-		ref := aggs[cell{c.workload, c.concurrency, ReferenceBackend}]
+		ref := aggs[cell{c.label, c.workload, c.concurrency, ReferenceBackend}]
 		ops := func(r Result) float64 { return r.OpsPerSec }
 		fmt.Fprintf(b, "| %d | %s | %d | %.0f (±%.0f%%) | %.1f | %.1f | %.1f | %s |\n",
 			c.concurrency, c.backend, len(a.runs), a.med(ops), 50*spread(a.all(ops)),
 			a.med(func(r Result) float64 { return r.Latency.P50 }),
 			a.med(func(r Result) float64 { return r.Latency.P99 }),
 			a.med(func(r Result) float64 { return r.Latency.P999 }),
-			ratio(a, ref, ops))
+			pairedRatio(a, ref, ops))
 	}
 }
 
 func writeServerTable(b *strings.Builder, cells []cell, aggs map[cell]*aggregate) {
 	b.WriteString("\n**Server cost per op** (median; event loop split into command execution and everything else)\n\n")
-	b.WriteString("| conc | backend | active µs | vs module | CPU µs | util (timeline min–max) | loop µs | cmd µs | other µs | ops/cycle | reads/op | writes/op | B in | B out | cmds/op | slowlog | errors |\n")
+	b.WriteString("| conc | backend | active µs | vs module (paired) | CPU µs | util (timeline min–max) | loop µs | cmd µs | other µs | ops/cycle | reads/op | writes/op | B in | B out | cmds/op | slowlog | errors |\n")
 	b.WriteString("|---:|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, c := range cells {
 		a := aggs[c]
 		if len(a.runs) == 0 {
 			continue
 		}
-		ref := aggs[cell{c.workload, c.concurrency, ReferenceBackend}]
+		ref := aggs[cell{c.label, c.workload, c.concurrency, ReferenceBackend}]
 		active := func(r Result) float64 { return r.Server.ActiveUsPerOp }
 		var tlMin, tlMax []float64
 		var slow, errs int64
@@ -208,7 +240,7 @@ func writeServerTable(b *strings.Builder, cells []cell, aggs map[cell]*aggregate
 			errs += r.Server.ErrorReplies
 		}
 		fmt.Fprintf(b, "| %d | %s | %.2f | %s | %.2f | %.2f (%.2f–%.2f) | %.2f | %.2f | %.2f | %.1f | %.3f | %.3f | %.0f | %.0f | %.2f | %d | %d |\n",
-			c.concurrency, c.backend, a.med(active), ratio(a, ref, active),
+			c.concurrency, c.backend, a.med(active), pairedRatio(a, ref, active),
 			a.med(func(r Result) float64 { return r.Server.CPUUsPerOp }),
 			a.med(func(r Result) float64 { return r.Server.Utilization }), median(tlMin), median(tlMax),
 			a.med(func(r Result) float64 { return r.Server.EventLoop.UsPerOp }),
@@ -283,7 +315,8 @@ func writeProfileTable(b *strings.Builder, cells []cell, aggs map[cell]*aggregat
 	b.WriteString(strings.Join(rows, "\n") + "\n")
 }
 
-// relativeToRuns shortens an artifact path to "<run label>/<file>".
+// relativeToRuns shortens an artifact path to "<run>/<file>"; the report already
+// groups by label.
 func relativeToRuns(path string) string {
 	return filepath.Join(filepath.Base(filepath.Dir(path)), filepath.Base(path))
 }
@@ -372,6 +405,9 @@ func writeEnvironment(b *strings.Builder, loads []Result, reclaims []ReclaimResu
 	}
 	h := servers[0].host
 	fmt.Fprintf(b, "- client %s %s/%s, %d CPUs, GOMAXPROCS=%d\n", h.GoVersion, h.GOOS, h.GOARCH, h.NumCPU, h.GOMAXPROCS)
+	if h.Placement != "" {
+		fmt.Fprintf(b, "- placement: %s\n", h.Placement)
+	}
 	var la []float64
 	for _, r := range loads {
 		la = append(la, r.LoadAvg[0], r.LoadAvg[1])

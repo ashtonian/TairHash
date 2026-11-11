@@ -33,6 +33,7 @@ type Result struct {
 	Kind        string    `json:"kind"`
 	Time        time.Time `json:"time"`
 	Label       string    `json:"label"`
+	Run         string    `json:"run"`
 	Backend     string    `json:"backend"`
 	Workload    string    `json:"workload"`
 	Concurrency int       `json:"concurrency"`
@@ -71,6 +72,7 @@ func newResult(b Backend, wl Workload, ks *Keyspace, cfg RunConfig, lr loadResul
 		Kind:        "load",
 		Time:        time.Now().UTC(),
 		Label:       cfg.Label,
+		Run:         RunID(b.Name, wl.Name, cfg.Concurrency, cfg.Repeat, cfg.Profiled),
 		Backend:     b.Name,
 		Workload:    wl.Name,
 		Concurrency: cfg.Concurrency,
@@ -96,7 +98,7 @@ func newResult(b Backend, wl Workload, ks *Keyspace, cfg RunConfig, lr loadResul
 		},
 		Server:      m,
 		ServerFacts: facts,
-		Host:        hostFacts(),
+		Host:        hostFacts(cfg.Placement),
 		Client:      cfg.Client,
 		LoadAvg:     load,
 	}

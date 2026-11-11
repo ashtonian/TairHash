@@ -65,13 +65,17 @@ type RunConfig struct {
 	Duration    time.Duration
 	Seed        uint64
 	Repeat      int
-	Label       string
+	// Label is free text recorded with the result, such as the module build;
+	// the report keeps each label's results apart.
+	Label string
 	// DB is the database the bench owns, for per-database server statistics.
 	DB int
 	// Client records the client options the run used.
 	Client ClientFacts
 	// ArtifactsDir, when set, receives the run's raw server captures.
 	ArtifactsDir string
+	// Placement is recorded in HostFacts.
+	Placement string
 	// SampleEvery is the server timeline period; zero disables the timeline.
 	SampleEvery time.Duration
 	// Profiled runs capture a client CPU profile and, with ServerProfiler, a
@@ -162,13 +166,22 @@ func drive(ctx context.Context, op Op, concurrency int, d time.Duration, seed ui
 	return res
 }
 
+// RunID names one run within a label: "<backend>-<workload>-c<conc>-r<repeat>",
+// or "-profile" in place of the repeat for the profiled pass. It is path-safe.
+func RunID(backend, workload string, concurrency, repeat int, profiled bool) string {
+	if profiled {
+		return fmt.Sprintf("%s-%s-c%d-profile", backend, workload, concurrency)
+	}
+	return fmt.Sprintf("%s-%s-c%d-r%d", backend, workload, concurrency, repeat)
+}
+
 // Run prepares wl on a flushed database, warms up, then measures one window
 // with full server-side capture.
 func Run(ctx context.Context, srv *Server, b Backend, wl Workload, ks *Keyspace, cfg RunConfig) (Result, error) {
 	if wl.NeedsVersions && b.Versioned == nil {
 		return Result{}, fmt.Errorf("workload %s needs versions, which backend %s lacks", wl.Name, b.Name)
 	}
-	art, err := newArtifacts(cfg.ArtifactsDir, cfg.Label)
+	art, err := newArtifacts(cfg.ArtifactsDir, cfg.Label, RunID(b.Name, wl.Name, cfg.Concurrency, cfg.Repeat, cfg.Profiled))
 	if err != nil {
 		return Result{}, err
 	}
@@ -360,14 +373,18 @@ type HostFacts struct {
 	GOARCH     string `json:"goarch"`
 	NumCPU     int    `json:"num_cpu"`
 	GOMAXPROCS int    `json:"gomaxprocs"`
+	// Placement is how the client and servers were bound to CPUs, as stated by
+	// whoever launched them (for example "client: taskpolicy -c utility").
+	Placement string `json:"placement,omitempty"`
 }
 
-func hostFacts() HostFacts {
+func hostFacts(placement string) HostFacts {
 	return HostFacts{
 		GoVersion:  runtime.Version(),
 		GOOS:       runtime.GOOS,
 		GOARCH:     runtime.GOARCH,
 		NumCPU:     runtime.NumCPU(),
 		GOMAXPROCS: runtime.GOMAXPROCS(0),
+		Placement:  placement,
 	}
 }

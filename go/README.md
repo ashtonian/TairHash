@@ -26,7 +26,7 @@ These are the module's actual behaviours, confirmed against `src/tairhash.c`. A 
 - `EXHPTTL` returns `-2` for a missing key and **`-3`** for a missing or expired field (CMDDOC says `-2` for both). `tairhash.ParsePTTL` handles both.
 - `EXHMSETWITHOPTS` takes TTLs in relative **seconds**, and `0` means *expire immediately*, not "no TTL". The driver requires whole seconds ≥ 1s.
 
-### Known module defect (upstream `9ee21d6`)
+### Known module defect (upstream `9ee21d6`; still present on `ci/valkey` `e64cd44`)
 
 `EXHINCRBY` and `EXHINCRBYFLOAT` with an expiry replicate `PXAT (milliseconds + now)` (`src/tairhash.c:1536` and `:1780`). `milliseconds` is already absolute, so replicas get a deadline about 56 years out. Reproduced: primary `EXHPTTL` 59493 ms, replica 1794387143522 ms. `EXHSET` replicates correctly. Until the module is fixed, counters with TTLs never expire on replicas or after a failover.
 
@@ -44,7 +44,8 @@ These are the module's actual behaviours, confirmed against `src/tairhash.c`. A 
 | `-fields` | int | `10` | Fields per hash. |
 | `-value-size` | int | `64` | Bytes per value. |
 | `-out` | path | `results.jsonl` | JSON-lines file that results are appended and fsynced to after each run. |
-| `-label` | string | `""` | Free-form label stored on each result (for example the module revision). |
+| `-label` | string | `""` | Free-form label stored on each result (for example the module revision and load args). The report renders each label separately and never pools results across labels. Artifacts go under a path-safe directory derived from it (see [Artifacts](#artifacts)). |
+| `-placement` | string | `""` | How the client and servers are bound to CPUs, stored in `host.placement` and shown in the report environment. `scripts/bench.sh` sets it. |
 | `-artifacts-dir` | path | `""` | Per-run raw server captures go here (see [Artifacts](#artifacts)). Required by `-profile`. |
 | `-pipeline-multiplex` | int | `2` | valkey-go `PipelineMultiplex`: 2ⁿ auto-pipelined connections per backend. |
 | `-conn-write-timeout` | duration | `10s` | valkey-go `ConnWriteTimeout`. |
@@ -63,7 +64,7 @@ These are the module's actual behaviours, confirmed against `src/tairhash.c`. A 
 | `-timeline-every` | duration | `1s` | Server timeline sampling period during measured windows. `0` disables it. |
 | `-profile` | bool | `false` | After the measured repeats, run every cell once more with the client CPU profiler and the server profiler. Profilers perturb timing, so the report uses profiled runs only for their profiles and never for their numbers. |
 | `-server-profiler` | string | `auto` | `auto` (sample on macOS, perf on Linux when installed), `sample`, `perf` or `none`. |
-| `-server-profiler-cmd` | string | `""` | Overrides the profiler command; `{pid}`, `{secs}` and `{out}` are substituted. Defaults: `sample {pid} {secs} 1 -mayDie -file {out}`; `perf record -F 999 -g -p {pid} -o {out} -- sleep {secs}`. |
+| `-server-profiler-cmd` | string | `""` | Overrides the profiler command. The template is split on whitespace first, then `{pid}`, `{secs}` and `{out}` are substituted inside each argument, so an output path with spaces stays one argument. Defaults: `sample {pid} {secs} 1 -mayDie -file {out}`; `perf record -F 999 -g -p {pid} -o {out} -- sleep {secs}`. |
 
 ### `thbench reclaim`
 
@@ -113,10 +114,13 @@ These are the module's actual behaviours, confirmed against `src/tairhash.c`. A 
 | `VALKEY_ADDR` | unset | tests | Integration tests skip unless set. Each test package owns one database (10–14, see `internal/testserver`) and flushes it. |
 | `VALKEY_VERSION` | `9.1.3` | make, scripts | Pinned Valkey tag built into `.cache/`. |
 | `VALKEY_SERVER` | `.cache/valkey-$VALKEY_VERSION/src/valkey-server` | `scripts/valkey-server.sh` | Server binary override. |
-| `MODULE_SRC` | `..` | make | TairHash tree the module is built from. |
+| `MODULE_SRC` | `..` | make | TairHash tree the module is built from. Each tree gets its own CMake build directory under `.cache/module-<mode>/`; the loaded `.so` and `source-revision` (commit plus `git status`) are per mode. |
 | `MODULE_MODE` | `scan` | make | `scan`, `sort` or `slab` active-expire algorithm. |
 | `MODULE_SO` | `.cache/module-scan/tairhash_module.so` | `scripts/bench.sh` | Module to load. |
 | `MODULE_ARGS` | `""` | `scripts/bench.sh` | Module load args, for example `active_expire_period 100 active_expire_keys_per_loop 10000`. |
+| `LABEL` | `tairhash@<rev>[+dirty][ MODULE_ARGS]` | `scripts/bench.sh` | Label passed to both `run` and `reclaim`. The default takes the first 7 characters of the commit in `source-revision` next to `MODULE_SO`, adds `+dirty` when that file lists uncommitted changes, and appends `MODULE_ARGS`. |
+| `CLIENT_QOS` | `utility` | `scripts/bench.sh` (macOS) | QoS clamp the client runs under (`taskpolicy -c`). Empty disables it. `background` is too slow: the client can no longer saturate the server. See [Troubleshooting](#troubleshooting). |
+| `CLIENT_CPUS` / `SERVER_CPUS` | unset | `scripts/bench.sh` (Linux) | `taskset -c` CPU lists for the client and for both servers. Give the server cores of its own. |
 | `PLAIN_PORT` / `MODULE_PORT` | `26379` / `26380` | `scripts/bench.sh` | Ports of the plain and module servers. |
 | `RECLAIM_ARGS` | `""` | `scripts/bench.sh` | Extra `thbench reclaim` flags. |
 | `SKIP_RECLAIM` | unset | `scripts/bench.sh` | Set to skip the reclaim scenario. |
@@ -139,6 +143,7 @@ These are the module's actual behaviours, confirmed against `src/tairhash.c`. A 
 | `github.com/google/pprof` | v0.0.0-20261111065629 (upstream publishes no tags) | Writes server profiles in pprof format. |
 | `sample` (macOS) / `perf` (Linux) | — | Server stack sampling for the profiled pass. The Valkey build already uses `-fno-omit-frame-pointer -g`, and `make module` adds `-fno-omit-frame-pointer` to the module, so stacks stay walkable through module frames. |
 | `gate-lock` | optional | `scripts/bench.sh` re-executes itself under `gate-lock run-exclusive` when it is on `PATH`. |
+| `taskpolicy` (macOS) / `taskset` (Linux, util-linux) | — | Client and server CPU placement in `scripts/bench.sh`. |
 
 ## API / Interfaces
 
@@ -228,12 +233,14 @@ make report OUT=bench/results/run1
 
 - `results.jsonl`
 - `report.md`
-- `runs/<label>/`
+- `runs/<label dir>/<run>/`
 - `run.log` and `reclaim.log`
 - the server logs
-- the host load before and after
+- `host-load.txt`: the host load before and after, the label, and the CPU placement
 
-Re-analyse any server capture with `thbench profile RAW`, and open profiles with `go tool pprof -http=: OUT/runs/<label>/server.main.pprof`.
+The client runs under the placement described by `CLIENT_QOS` (macOS) or `CLIENT_CPUS`/`SERVER_CPUS` (Linux). Each result records it. If a phase fails, the script skips the remaining phases, still renders `report.md` from the results recorded so far, and exits with the failing phase's status.
+
+Re-analyse any server capture with `thbench profile RAW`, and open profiles with `go tool pprof -http=: OUT/runs/<label dir>/<run>/server.main.pprof`.
 
 ## Operations
 
@@ -244,6 +251,7 @@ Each run brackets its measured window with `CONFIG RESETSTAT`, `SLOWLOG RESET` a
 | Metric (`server_metrics.*` in `results.jsonl`) | Meaning |
 |---|---|
 | `ops_per_sec`, `latency.p50/p99/p999_us` (client) | Client-observed throughput and latency, including the loopback round trip and client CPU. |
+| Report `vs module (paired)` | For each repeat, the backend's value divided by `module`'s in the same repeat, then the median of those ratios, with their spread. A cell's backends run back to back within a repeat, so pairing cancels host-load drift between repeats. A ratio of medians would keep that drift. |
 | `active_us_per_op` | Δ`used_active_time_main_thread` ÷ ops: main-thread busy time per operation, including parsing and replies. Every command runs on that thread, so this sets peak throughput and is the primary comparison metric. |
 | `cpu_us_per_op` | Δ(`used_cpu_user` + `used_cpu_sys`) ÷ ops, across all threads. |
 | `utilization`, `timeline.utilization_min/max` | Main-thread busy time ÷ wall time, for the window and per second. Below ~0.9 the client or the round trip limited the run. A wide min–max range means the window was not steady. |
@@ -261,7 +269,7 @@ Each run brackets its measured window with `CONFIG RESETSTAT`, `SLOWLOG RESET` a
 
 ### Artifacts
 
-`-artifacts-dir` gets one directory per run (`<backend>-<workload>-c<conc>-r<repeat>`, `...-profile`, `reclaim-<backend>`):
+`-artifacts-dir` gets one directory per run at `<label dir>/<run>`. The run is `<backend>-<workload>-c<conc>-r<repeat>`, `...-profile` or `reclaim-<backend>`, and is also stored as `run` in each result. The label directory is the label with every run of characters outside `[A-Za-z0-9._@+-]` collapsed to `-`. When that changes the label, an 8-hex-digit hash of the original is appended so distinct labels never share a directory. Without a label, runs sit directly under `-artifacts-dir`.
 
 | File | Content |
 |---|---|
@@ -291,7 +299,10 @@ macOS `sample` is wall-clock, so main-thread samples blocked in `kevent` count a
 - **`backend native: server lacks HSETEX`**: the server is older than Valkey 9.0.
 - **`load took Xs, past the lease`** (reclaim): loading outran the shared deadline. Raise `-lease` or shrink `-keys`/`-fields`.
 - **reclaim reports `no (N keys left)` for `module`**: expected with SCAN-mode defaults, which reclaim ≤ 1000 fields per second per database. Check `server.tairhash_active_expire` in the result, then rerun with `MODULE_ARGS='active_expire_period 100 active_expire_keys_per_loop 10000'` to measure a tuned configuration.
-- **Large run-to-run spread**: check `load_avg_1m_start_end` in each result. Another tenant on the host competes for CPU. `scripts/bench.sh` takes `gate-lock run-exclusive` when available.
+- **Large run-to-run spread, or throughput that falls with `load_avg_1m_start_end`**: the server's main thread is competing for CPU.
+  - **Apple silicon**: an M4 has 4 performance and 6 efficiency cores. Once load exceeds the performance-core count, the scheduler can move `valkey-server` onto an efficiency core, and its cost per op rises by tens of percent. Check `host.placement` in the result: `client: taskpolicy -c utility` keeps the load generator mostly off the performance cores. Other processes still compete, so check `host-load.txt` and the per-repeat load in each result. Compare backends with the paired `vs module` ratio, not absolute numbers.
+  - **Linux**: set `SERVER_CPUS` and `CLIENT_CPUS` to disjoint cores.
+  - **Either platform**: `scripts/bench.sh` takes `gate-lock run-exclusive` when it is available.
 - **`server profiler: sample: ... exit status`** (macOS): `sample` must be able to attach to `valkey-server`. That works for a binary you built and run as the same user. A hardened or SIP-protected binary refuses. Use `-server-profiler none` to skip it.
 - **`server profiler: perf: ... Permission denied`** (Linux): lower `kernel.perf_event_paranoid` (for example `sysctl kernel.perf_event_paranoid=1`) or run with `CAP_PERFMON`. Install `perf` matching the kernel.
 - **Profile summary lists many `unclassified` leaves**: a new Valkey version renamed hot functions. Extend `componentRules` in `internal/serverprof/classify.go`, then re-run `thbench profile` on the saved raw capture.

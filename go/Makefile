@@ -19,6 +19,8 @@ MODULE_SRC  ?= ..
 MODULE_MODE ?= scan
 MODULE_DIR  := $(CACHE)/module-$(MODULE_MODE)
 MODULE_SO   := $(abspath $(MODULE_DIR))/tairhash_module.so
+# CMake pins a build tree to one source directory, so each MODULE_SRC gets its own.
+MODULE_BUILD := $(MODULE_DIR)/build-$(shell printf %s "$(abspath $(MODULE_SRC))" | cksum | cut -d' ' -f1)
 
 TEST_PORT ?= 26999
 OUT       ?= bench/results/$(shell date -u +%Y%m%dT%H%M%SZ)
@@ -45,9 +47,9 @@ $(VALKEY_SERVER):
 # configure trees that still declare cmake_minimum_required(VERSION 3.0). Frame
 # pointers keep server profiles walkable through module frames on every platform.
 module:
-	cmake -S $(MODULE_SRC) -B $(MODULE_DIR)/build -DCMAKE_BUILD_TYPE=Release \
+	cmake -S $(MODULE_SRC) -B $(MODULE_BUILD) -DCMAKE_BUILD_TYPE=Release \
 		-DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_C_FLAGS=-fno-omit-frame-pointer $(MODULE_CMAKE_FLAGS)
-	cmake --build $(MODULE_DIR)/build -j
+	cmake --build $(MODULE_BUILD) -j
 	cp $(MODULE_SRC)/lib/tairhash_module.so $(MODULE_SO)
 	git -C $(MODULE_SRC) rev-parse HEAD > $(MODULE_DIR)/source-revision
 	git -C $(MODULE_SRC) status --porcelain >> $(MODULE_DIR)/source-revision

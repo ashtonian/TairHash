@@ -14,9 +14,10 @@ import (
 )
 
 // Profiler samples the server process for a measured window by running an
-// external command, then converts the capture with serverprof. The template's
-// {pid}, {secs} and {out} placeholders are substituted; each remaining
-// whitespace-separated word is one argument.
+// external command, then converts the capture with serverprof. Each
+// whitespace-separated word of the template is one argument, and the {pid},
+// {secs} and {out} placeholders are substituted inside it, so substituted
+// values (an output path with spaces) never split into extra arguments.
 type Profiler struct {
 	Format   serverprof.Format
 	Template string
@@ -66,16 +67,28 @@ func (p *Profiler) rawName() string {
 	return "server.sample.txt"
 }
 
-// Start launches the profiler and returns a function that waits for it.
-func (p *Profiler) Start(ctx context.Context, pid int, d time.Duration, out string) (func() error, error) {
+// argv expands the template for one capture.
+func (p *Profiler) argv(pid int, d time.Duration, out string) ([]string, error) {
 	secs := int(d.Round(time.Second) / time.Second)
 	if secs < 1 {
 		secs = 1
 	}
-	r := strings.NewReplacer("{pid}", strconv.Itoa(pid), "{secs}", strconv.Itoa(secs), "{out}", out)
-	argv := strings.Fields(r.Replace(p.Template))
-	if len(argv) == 0 {
+	words := strings.Fields(p.Template)
+	if len(words) == 0 {
 		return nil, fmt.Errorf("empty profiler template")
+	}
+	r := strings.NewReplacer("{pid}", strconv.Itoa(pid), "{secs}", strconv.Itoa(secs), "{out}", out)
+	for i, w := range words {
+		words[i] = r.Replace(w)
+	}
+	return words, nil
+}
+
+// Start launches the profiler and returns a function that waits for it.
+func (p *Profiler) Start(ctx context.Context, pid int, d time.Duration, out string) (func() error, error) {
+	argv, err := p.argv(pid, d, out)
+	if err != nil {
+		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	var stderr strings.Builder

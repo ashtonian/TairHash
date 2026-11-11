@@ -29,6 +29,8 @@ type ReclaimConfig struct {
 	Label            string
 	DB               int
 	ArtifactsDir     string
+	// Placement is recorded in HostFacts.
+	Placement string
 }
 
 // ReclaimSample is one point of the reclamation timeline.
@@ -87,11 +89,7 @@ func Reclaim(ctx context.Context, srv *Server, b Backend, ks *Keyspace, cfg Recl
 		Kind: "reclaim", Label: cfg.Label, Backend: b.Name,
 		Keys: ks.Keys, Fields: ks.Fields, ValueSize: ks.ValueSize, Lease: cfg.Lease.String(),
 	}
-	label := "reclaim-" + b.Name
-	if cfg.Label != "" {
-		label = cfg.Label + "/" + label
-	}
-	art, err := newArtifacts(cfg.ArtifactsDir, label)
+	art, err := newArtifacts(cfg.ArtifactsDir, cfg.Label, "reclaim-"+b.Name)
 	if err != nil {
 		return res, err
 	}
@@ -102,7 +100,7 @@ func Reclaim(ctx context.Context, srv *Server, b Backend, ks *Keyspace, cfg Recl
 	if res.ServerFacts, err = srv.Facts(ctx); err != nil {
 		return res, err
 	}
-	res.Host = hostFacts()
+	res.Host = hostFacts(cfg.Placement)
 	if err := srv.ResetDiagnostics(ctx); err != nil {
 		return res, err
 	}

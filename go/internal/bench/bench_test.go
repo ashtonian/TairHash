@@ -97,5 +97,64 @@ func TestReportExcludesProfiledRuns(t *testing.T) {
 	var out strings.Builder
 	require.NoError(t, Report(&out, loads, nil))
 	assert.Contains(t, out.String(), "| 16 | lua | 1 | 50 (±0%) |")
-	assert.Contains(t, out.String(), "| 16 | lua | 5.00 | 2.50x |")
+	assert.Contains(t, out.String(), "| 16 | lua | 5.00 | 2.50x (±0%) |")
+}
+
+func TestPairedRatioCancelsDriftBetweenRepeats(t *testing.T) {
+	runs := func(vals ...float64) *aggregate {
+		a := &aggregate{}
+		for i, v := range vals {
+			a.runs = append(a.runs, Result{Repeat: i, OpsPerSec: v})
+		}
+		return a
+	}
+	ops := func(r Result) float64 { return r.OpsPerSec }
+	// Repeat 1 ran on a loaded host. Per-repeat ratios are 0.5, 0.5, 0.75; a
+	// ratio of medians would report 50/80 = 0.62.
+	module, lua := runs(100, 50, 80), runs(50, 25, 60)
+	assert.Equal(t, "0.50x (±25%)", pairedRatio(lua, module, ops))
+	assert.Equal(t, "—", pairedRatio(lua, nil, ops))
+	assert.Equal(t, "—", pairedRatio(runs(), module, ops))
+}
+
+func TestReportKeepsLabelsApart(t *testing.T) {
+	loads := []Result{
+		{Label: "build-a", Workload: "get", Concurrency: 1, Backend: "module", OpsPerSec: 100},
+		{Label: "build-b", Workload: "get", Concurrency: 1, Backend: "module", OpsPerSec: 300},
+	}
+	var out strings.Builder
+	require.NoError(t, Report(&out, loads, nil))
+	assert.Contains(t, out.String(), "\n# build-a\n")
+	assert.Contains(t, out.String(), "\n# build-b\n")
+	assert.Contains(t, out.String(), "| 1 | module | 1 | 100 (±0%) |")
+	assert.Contains(t, out.String(), "| 1 | module | 1 | 300 (±0%) |")
+}
+
+func TestLabelDir(t *testing.T) {
+	tests := []struct {
+		name, label, want string
+	}{
+		{"safe label kept", "e64cd44-scan", "e64cd44-scan"},
+		{"unsafe characters hashed", "tairhash@e64cd44 scan, valkey 9.1.3", "tairhash@e64cd44-scan-valkey-9.1.3-"},
+		{"nothing safe", "///", "label-"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := labelDir(tt.label)
+			assert.True(t, strings.HasPrefix(got, tt.want), "%q -> %q", tt.label, got)
+			assert.NotContains(t, got, "/")
+			assert.NotContains(t, got, " ")
+		})
+	}
+	assert.NotEqual(t, labelDir("a b"), labelDir("a,b"), "labels that sanitize alike stay distinct")
+}
+
+func TestProfilerArgvKeepsSubstitutedPathWhole(t *testing.T) {
+	p := &Profiler{Template: "sample {pid} {secs} 1 -file {out}"}
+	argv, err := p.argv(42, 10*time.Second, "/tmp/run dir, with spaces/server.sample.txt")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"sample", "42", "10", "1", "-file", "/tmp/run dir, with spaces/server.sample.txt"}, argv)
+
+	_, err = (&Profiler{Template: "  "}).argv(1, time.Second, "x")
+	assert.Error(t, err)
 }

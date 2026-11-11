@@ -79,6 +79,7 @@ type common struct {
 	multiplex    int
 	writeTimeout time.Duration
 	artifacts    string
+	placement    string
 }
 
 func (c *common) register(fs *flag.FlagSet) {
@@ -96,6 +97,7 @@ func (c *common) register(fs *flag.FlagSet) {
 	fs.IntVar(&c.multiplex, "pipeline-multiplex", 2, "valkey-go PipelineMultiplex: 2^n pipelined connections")
 	fs.DurationVar(&c.writeTimeout, "conn-write-timeout", 10*time.Second, "valkey-go ConnWriteTimeout")
 	fs.StringVar(&c.artifacts, "artifacts-dir", "", "directory for per-run raw server captures (INFO, config, slowlog, latency, timeline, profiles)")
+	fs.StringVar(&c.placement, "placement", "", "how the client and servers are bound to CPUs, recorded with every result (scripts/bench.sh sets it)")
 }
 
 // target is one backend bound to the server it runs against.
@@ -274,17 +276,10 @@ func runCmd(ctx context.Context, log *slog.Logger, args []string) error {
 					if wl.NeedsVersions && t.Versioned == nil {
 						continue
 					}
-					label := fmt.Sprintf("%s-%s-c%d-r%d", t.Name, wl.Name, conc, rep)
-					if profiled {
-						label = fmt.Sprintf("%s-%s-c%d-profile", t.Name, wl.Name, conc)
-					}
-					if c.label != "" {
-						label = c.label + "/" + label
-					}
 					cfg := bench.RunConfig{
 						Concurrency: conc, Warmup: *warmup, Duration: *duration,
-						Seed: *seed + uint64(rep), Repeat: rep, Label: label, DB: c.db,
-						Client: e.client, ArtifactsDir: c.artifacts, SampleEvery: *timelineEvery,
+						Seed: *seed + uint64(rep), Repeat: rep, Label: c.label, DB: c.db,
+						Client: e.client, ArtifactsDir: c.artifacts, Placement: c.placement, SampleEvery: *timelineEvery,
 						Profiled: profiled, ServerProfiler: prof,
 					}
 					res, err := bench.Run(ctx, t.srv, t.Backend, wl, ks, cfg)
@@ -295,7 +290,7 @@ func runCmd(ctx context.Context, log *slog.Logger, args []string) error {
 						return err
 					}
 					attrs := []any{
-						slog.String("label", label), slog.Bool("profiled", profiled),
+						slog.String("label", res.Label), slog.String("run", res.Run), slog.Bool("profiled", profiled),
 						slog.Float64("ops_per_sec", res.OpsPerSec),
 						slog.Float64("p50_us", res.Latency.P50), slog.Float64("p99_us", res.Latency.P99),
 						slog.Float64("server_active_us_per_op", res.Server.ActiveUsPerOp),
@@ -345,7 +340,7 @@ func reclaimCmd(ctx context.Context, log *slog.Logger, args []string) error {
 		res, err := bench.Reclaim(ctx, t.srv, t.Backend, ks, bench.ReclaimConfig{
 			Lease: *lease, Timeout: *timeout, Poll: *poll,
 			SweepEvery: *sweepEvery, SweepBudget: *sweepBudget, MemorySampleKeys: *memSample,
-			Label: c.label, DB: c.db, ArtifactsDir: c.artifacts,
+			Label: c.label, DB: c.db, ArtifactsDir: c.artifacts, Placement: c.placement,
 		})
 		if err != nil {
 			return fmt.Errorf("reclaim %s: %w", t.Name, err)
