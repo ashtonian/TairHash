@@ -21,6 +21,7 @@
 - Supports setting expiration and version for field
 - Support efficient active expiration (SCAN mode, SORT mode and SLAB mode) and passivity expiration for field
 - Support field expired event notification (based on pubsub)
+- Supports last-write-wins writes and source-of-truth sync (`EXHMSETLWW`, `EXHSYNCGET`, `EXHSYNC`), so a TairHash can cache an external store without serving a partial copy; see [Last-write-wins and source-of-truth sync](CMDDOC.md#last-write-wins-and-source-of-truth-sync)
 
 ## Active expiration
 ### SCAN_MODE(default):
@@ -135,9 +136,30 @@ then the tairhash_module.so library file will be generated in the lib directory
 ```  
 ## TEST
 
-1. Modify the path in the tairhash.tcl file in the `tests` directory to `set testmodule [file your_path/tairhash_module.so]`
-2. Add the path of the tairhash.tcl file in the `tests` directory to the all_tests of redis test_helper.tcl
-3. run ./runtest --single tairhash
+`tests/run.sh` builds the module and runs the TCL suites in `tests/` inside a Redis source
+tree's test framework, the same way CI does. The Redis tree is cloned and built once under
+`.deps/` and reused; each module variant builds into its own directory under `build/`.
+
+```
+tests/run.sh                                  # every suite, scan mode, against Redis 7.0
+tests/run.sh --mode sort --suite tairhash_lww # one suite, another expire mode
+tests/run.sh --sanitizer address              # module and server built with ASan
+tests/run.sh --coverage                       # line/function coverage of the module
+tests/run.sh --server-ref 7.2 -- --baseport 25000   # another server branch, extra runtest args
+```
+
+Requirements: a C toolchain, CMake 3.10+, git and Tcl 8.5+. On macOS the
+`Exhincrbyfloat*` tests fail because `long double` is 64-bit there; they pass on Linux.
+
+To run a suite by hand instead: replace `your_path` in the suite with the directory of
+`tairhash_module.so`, copy it to `tests/unit/type/` in a Redis source tree and run
+`./runtest --single unit/type/<suite>`.
+
+## Upgrading
+
+The RDB encoding version is 1. Data written by this version can not be loaded by older
+builds, and older replicas reject the replication stream it produces (`EXHSET ... SEQ`):
+upgrade replicas before their master. Version 0 data loads unchanged.
 
 
 ## Client

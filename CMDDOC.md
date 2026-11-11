@@ -994,3 +994,173 @@ OK
 ```
 
 <br/>
+
+## Last-write-wins and source-of-truth sync
+
+These commands keep a TairHash as a cache of an external source of truth (for example a
+database table holding the latest value per field) without ever serving a partial copy:
+
+1. Writers apply each change with `EXHMSETLWW`, using the source's write timestamp as the
+   version. A write that loses to a newer one is an expected outcome, not an error.
+2. Readers call `EXHSYNCGET`. A hash that was never synced (new, evicted, or lost on a
+   restart) is a miss: the reader reads the full set of fields from the source and hands it
+   to `EXHSYNC` together with the token `EXHSYNCGET` returned.
+3. `EXHSYNC` merges the snapshot, removes fields the source no longer has, and marks the
+   hash synced. Fields written after the token raced the snapshot read and are kept,
+   whatever their version.
+
+Every value write (by any command) is stamped with a server-assigned write sequence. The
+sequence is strictly increasing, is replicated and persisted, and stays above sequences
+handed out by an earlier process or a failed-over master, so tokens remain valid across
+key deletion, restart and failover.
+
+#### EXHMSETLWW
+
+
+Grammar and complexity：
+
+
+> EXHMSETLWW key field value version [field value version ...]
+> time complexity：O(N), N is the number of fields
+
+
+
+Command Description：
+
+
+> Apply last-write-wins writes to the fields of the TairHash specified by key, creating it if it does not exist. A write lands when the field does not exist, when its version is higher than the field's, or when the versions are equal and its value is byte-wise greater (shorter values sort first when one is a prefix of the other). The tie-break is the one Cassandra/Scylla use for equal write timestamps, so the result does not depend on the order writes arrive in. A landed write replaces the value and version and clears the field's TTL. Fields are applied in argument order.
+
+
+
+Parameter：
+
+
+> key: The key used to find the TairHash
+> field: An element in TairHash
+> value: The value to write
+> version: The version of the write, a positive integer (for example the source's write timestamp in microseconds)
+
+
+
+Return：
+
+
+> An array with one integer per field: 1 if the write landed, 0 if the field already held a winning write
+> Error: syntax error if a version is not a positive integer (nothing is written); WRONGTYPE if the key holds another type
+
+```sh
+127.0.0.1:6379> EXHMSETLWW k0 f1 21.5 1731300000000001 f2 7 1731300000000001
+1) (integer) 1
+2) (integer) 1
+127.0.0.1:6379> EXHMSETLWW k0 f1 20.9 1731299999000000 f2 8 1731300000000001
+1) (integer) 0
+2) (integer) 1
+127.0.0.1:6379> EXHGETWITHVER k0 f2
+1) "8"
+2) (integer) 1731300000000001
+```
+
+#### EXHSYNCGET
+
+
+Grammar and complexity：
+
+
+> EXHSYNCGET key [field ...]
+> time complexity：O(N), N is the number of fields in the TairHash, or of the fields given
+
+
+
+Command Description：
+
+
+> Read the TairHash specified by key if it is synced (see EXHSYNC), together with a sync token. A TairHash that does not exist or was never synced is a miss: no fields are returned, and the token should be passed to EXHSYNC with a snapshot read from the source of truth after this call. With fields given, only those that exist are returned, in request order; on a synced TairHash a missing field means the source has no value for it. Expired fields are not returned.
+
+
+
+Parameter：
+
+
+> key: The key used to find the TairHash
+> field: Fields to return (default: all fields)
+
+
+
+Return：
+
+
+> An array of three elements: 1 if the TairHash is synced and 0 otherwise; the sync token (an integer); and an array of field, value, version triples (empty on a miss)
+> Error: WRONGTYPE if the key holds another type
+
+```sh
+127.0.0.1:6379> EXHSYNCGET k1
+1) (integer) 0
+2) (integer) 1794387046202298
+3) (empty array)
+127.0.0.1:6379> EXHSYNC k1 1794387046202298 f1 21.5 1731300000000001
+1) (integer) 1
+2) (integer) 0
+127.0.0.1:6379> EXHSYNCGET k1 f1 missing
+1) (integer) 1
+2) (integer) 1794387046210665
+3) 1) "f1"
+   2) "21.5"
+   3) (integer) 1731300000000001
+```
+
+#### EXHSYNC
+
+
+Grammar and complexity：
+
+
+> EXHSYNC key token [field value version ...]
+> time complexity：O(N + M), N is the number of fields in the snapshot, M the number of fields in the TairHash
+
+
+
+Command Description：
+
+
+> Reconcile the TairHash specified by key with a full snapshot of the source of truth, read after EXHSYNCGET returned token. Snapshot fields are merged with EXHMSETLWW semantics. Fields not in the snapshot are removed unless they were written after token. The TairHash is then marked synced, and a synced TairHash is kept even when it has no fields, so an empty snapshot caches "the source has nothing for this key". A synced TairHash stays synced until the key is deleted.
+
+
+
+Parameter：
+
+
+> key: The key used to find the TairHash
+> token: The token returned by EXHSYNCGET before the snapshot was read (0 removes nothing written before the call)
+> field value version: The snapshot; versions are positive integers
+
+
+
+Return：
+
+
+> An array of two integers: the number of snapshot fields whose write landed, and the number of fields removed
+> Error: syntax error if the token is negative or a version is not a positive integer (nothing is changed); WRONGTYPE if the key holds another type
+
+```sh
+127.0.0.1:6379> EXHSYNC k2 0
+1) (integer) 0
+2) (integer) 0
+127.0.0.1:6379> EXHSYNCGET k2
+1) (integer) 1
+2) (integer) 1794387046210665
+3) (empty array)
+```
+
+#### Replication and persistence
+
+Write commands replicate the resulting state of each field (`EXHSET key field value ABS
+version [PXAT expire] SEQ seq`) instead of the request, so a replica or an AOF replay
+reproduces versions, TTLs and write sequences exactly, independently of its own clock.
+EXHSYNC also emits `EXHSYNCREPL key` to mark the hash synced. The `SEQ` option and
+`EXHSYNCREPL` are accepted only from the replication stream or while loading; a regular
+client gets `ERR only accepted from the replication stream or while loading`.
+
+The RDB encoding is version 1 (adds the synced flag and per-field write sequences).
+Version 0 data loads as unsynced, with write sequence 0. Data written by this version can
+not be loaded by older builds, and an older replica rejects the `SEQ` option: upgrade
+replicas before their master.

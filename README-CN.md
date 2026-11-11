@@ -20,6 +20,7 @@
 - field支持单独设置expire和version
 - 针对field支持高效的active expire和passivity expire，其中active expire支持SCAN_MODE、SORT_MODE和SLAB_MODE模式。
 - 支持field过期删除事件通知（基于pubsub）
+- 支持last-write-wins写入与数据源同步（`EXHMSETLWW`、`EXHSYNCGET`、`EXHSYNC`），使TairHash可以作为外部存储的缓存而不会返回不完整的数据，详见[CMDDOC-CN.md](CMDDOC-CN.md#last-write-wins写入与数据源同步)
 
 ## 主动过期
 
@@ -130,9 +131,23 @@ cmake ../ && make -j
 ```  
 ## 测试方法
 
-1. 修改`tests`目录下tairhash.tcl文件中的路径为`set testmodule [file your_path/tairhash_module.so]`
-2. 将`tests`目录下tairhash.tcl文件路径加入到redis的test_helper.tcl的all_tests中
-3. 在redis根目录下运行./runtest --single tairhash
+`tests/run.sh` 会编译模块，并在Redis源码的测试框架中运行 `tests/` 下的TCL测试（与CI一致）。Redis源码只会在 `.deps/` 下克隆并编译一次；每种模块变体编译到 `build/` 下各自的目录。
+
+```
+tests/run.sh                                  # 所有测试，SCAN模式，Redis 7.0
+tests/run.sh --mode sort --suite tairhash_lww # 指定测试与过期模式
+tests/run.sh --sanitizer address              # 使用ASan编译模块与Redis
+tests/run.sh --coverage                       # 输出模块的行/函数覆盖率
+tests/run.sh --server-ref 7.2 -- --baseport 25000   # 其他Redis分支，附加runtest参数
+```
+
+依赖：C编译工具链、CMake 3.10+、git、Tcl 8.5+。macOS上 `long double` 为64位，`Exhincrbyfloat*` 测试会失败，Linux上正常。
+
+手动运行：将测试文件中的 `your_path` 替换为 `tairhash_module.so` 所在目录，复制到Redis源码的 `tests/unit/type/` 下，运行 `./runtest --single unit/type/<suite>`。
+
+## 升级
+
+RDB编码版本为1。此版本写入的数据无法被旧版本加载，旧版本的从节点也会拒绝此版本产生的复制流（`EXHSET ... SEQ`），请先升级从节点再升级主节点。编码版本0的数据可以直接加载。
 
 ## 客户端
 

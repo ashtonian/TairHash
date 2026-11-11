@@ -998,3 +998,124 @@ OK
 ```
 
 <br/>
+
+## Last-write-wins写入与数据源同步
+
+以下命令用于把TairHash作为外部数据源（例如保存每个field最新值的数据库表）的缓存，并且不会返回不完整的数据：
+
+1. 写入方使用 `EXHMSETLWW` 写入每次变更，以数据源的写入时间戳作为版本。被更新的写入覆盖是预期结果，不是错误。
+2. 读取方调用 `EXHSYNCGET`。从未同步过的TairHash（新建、被淘汰或重启后丢失）视为未命中：读取方从数据源读取全部field，连同 `EXHSYNCGET` 返回的token一起交给 `EXHSYNC`。
+3. `EXHSYNC` 合并快照，删除数据源中已不存在的field，并把TairHash标记为已同步。在token之后写入的field与快照读取存在竞争，无论版本如何都会保留。
+
+所有写入value的命令都会为field记录一个由服务端分配的写入序号。序号严格递增，会被复制和持久化，并且总是大于之前的进程或故障切换前的主节点分配的序号，因此token在key删除、重启和故障切换后依然有效。
+
+#### EXHMSETLWW
+
+
+语法及复杂度：
+
+
+> EXHMSETLWW key field value version [field value version ...]
+> 时间复杂度：O(N)，N为field个数
+
+
+
+命令描述：
+
+
+> 以last-write-wins语义写入key指定的TairHash中的field，TairHash不存在时自动创建。当field不存在、版本更高，或版本相同且value按字节比较更大（一个value是另一个的前缀时，较短的更小）时写入生效。版本相同时的比较规则与Cassandra/Scylla相同，因此结果与写入到达的顺序无关。生效的写入会替换value和版本，并清除field的过期时间。field按参数顺序写入。
+
+
+
+参数：
+
+
+> key: 用于查找该TairHash的键
+> field: TairHash中的一个元素
+> value: 写入的值
+> version: 写入的版本，正整数（例如数据源的微秒级写入时间戳）
+
+
+
+返回值：
+
+
+> 成功：返回数组，每个field对应一个整数，1表示写入生效，0表示field已有更新（或比较更大）的写入
+> 失败：版本不是正整数时返回syntax error（不会写入任何数据）；key为其他类型时返回WRONGTYPE
+
+
+
+#### EXHSYNCGET
+
+
+语法及复杂度：
+
+
+> EXHSYNCGET key [field ...]
+> 时间复杂度：O(N)，N为TairHash中的field个数或指定的field个数
+
+
+
+命令描述：
+
+
+> 如果key指定的TairHash已同步（见EXHSYNC），返回其内容以及同步token。TairHash不存在或从未同步时视为未命中：不返回field，调用方应在此调用之后从数据源读取快照，并把token交给EXHSYNC。指定field时只返回存在的field，顺序与请求一致；对已同步的TairHash，field不存在表示数据源中没有该field。已过期的field不会返回。
+
+
+
+参数：
+
+
+> key: 用于查找该TairHash的键
+> field: 要返回的field（默认返回全部）
+
+
+
+返回值：
+
+
+> 成功：返回三个元素的数组：已同步为1否则为0；同步token（整数）；field、value、version三元组组成的数组（未命中时为空）
+> 失败：key为其他类型时返回WRONGTYPE
+
+
+
+#### EXHSYNC
+
+
+语法及复杂度：
+
+
+> EXHSYNC key token [field value version ...]
+> 时间复杂度：O(N + M)，N为快照中的field个数，M为TairHash中的field个数
+
+
+
+命令描述：
+
+
+> 用数据源的完整快照（在EXHSYNCGET返回token之后读取）校正key指定的TairHash：快照中的field按EXHMSETLWW语义合并；不在快照中的field会被删除，除非它们在token之后写入；最后把TairHash标记为已同步。已同步的TairHash即使没有field也会保留，因此空快照可以缓存“数据源中没有该key的数据”。已同步状态在key被删除之前一直保持。
+
+
+
+参数：
+
+
+> key: 用于查找该TairHash的键
+> token: 读取快照之前EXHSYNCGET返回的token（0表示不删除调用之前写入的任何field）
+> field value version: 快照内容，版本为正整数
+
+
+
+返回值：
+
+
+> 成功：返回两个整数的数组：写入生效的快照field个数，以及删除的field个数
+> 失败：token为负数或版本不是正整数时返回syntax error（不做任何修改）；key为其他类型时返回WRONGTYPE
+
+
+
+#### 复制与持久化
+
+写命令复制每个field的结果状态（`EXHSET key field value ABS version [PXAT expire] SEQ seq`）而不是原始请求，因此从节点或AOF重放可以精确还原版本、过期时间和写入序号，与其自身时钟无关。EXHSYNC还会发送 `EXHSYNCREPL key` 标记已同步。`SEQ` 选项与 `EXHSYNCREPL` 只接受来自复制流或加载过程的调用，普通客户端会收到 `ERR only accepted from the replication stream or while loading`。
+
+RDB编码版本为1（增加已同步标记与每个field的写入序号）。版本0的数据加载后为未同步状态，写入序号为0。此版本写入的数据无法被旧版本加载，旧版本的从节点会拒绝 `SEQ` 选项：请先升级从节点再升级主节点。
