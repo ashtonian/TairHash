@@ -29,7 +29,7 @@
 - 内置定时器会周期使用SCAN命令找到包含过期field的TairHash，然后检查TairHash内部的排序索引，进行field的淘汰
 - 排序中所有的key和field都是指针引用，无内存拷贝，无内存膨胀问题
 
-**支持的redis版本**: redis >= 5.0  
+**支持的版本**: redis >= 5.0, valkey >= 7.2  
 **优点**：可以运行在低版本的redis中（redis >= 5.0 ）      
 **缺点**：过期淘汰效率较低（相对SORT模式而言，特别是redis中含有过多的干扰key时）  
 
@@ -41,7 +41,7 @@
 - 内置定时器会周期扫描第一级索引，找出一部分已经过期的key，然后分别再检查这些key的二级索引，进行field的淘汰，也就是active expire
 - 排序中所有的key和field都是指针引用，无内存拷贝，无内存膨胀问题
 
-**支持的redis版本**: redis >= 7.0  
+**支持的版本**: redis >= 7.0, valkey >= 7.2  
 **优点**：过期淘汰效率比较高      
 **缺点**：更多的内存消耗  
 
@@ -52,7 +52,7 @@
 - 和SORT模式一样，也会依赖key的全局排序索引进行过期key的快速查找。和SORT模式不同的是，SLAB不会对key内部的field进行排序索引，相反他们是无序的，这样可以节省索引内存开销‘
 - SLAB过期算法使用SIMD指令（当硬件支持时）来加速对过期field的查找
 
-**支持的redis版本**: redis >= 7.0  
+**支持的版本**: redis >= 7.0, valkey >= 7.2  
 
 **优点**：高效淘汰，低内存消耗，快速访问，为过期算法带来新思路  
 
@@ -127,12 +127,19 @@ cmake ../ && make -j
 
 ```
 ./redis-server --loadmodule /path/to/tairhash_module.so
+./valkey-server --loadmodule /path/to/tairhash_module.so
 ```  
 ## 测试方法
 
-1. 修改`tests`目录下tairhash.tcl文件中的路径为`set testmodule [file your_path/tairhash_module.so]`
-2. 将`tests`目录下tairhash.tcl文件路径加入到redis的test_helper.tcl的all_tests中
-3. 在redis根目录下运行./runtest --single tairhash
+`tests/tairhash.tcl`需要在已编译的Redis或Valkey源码目录的测试框架中运行：
+
+1. 将其复制到服务端源码目录，并把`your_path`替换为`tairhash_module.so`所在目录：
+   `sed -e "s#your_path#$(pwd)/lib#g" tests/tairhash.tcl > /path/to/server/tests/unit/type/tairhash.tcl`
+2. 在服务端源码目录下运行`./runtest --single unit/type/tairhash`
+
+如果服务启动失败并提示`unix socket path too long`，请将服务端源码目录移到更短的路径：测试框架会在`tests/tmp`下创建Unix socket，而macOS限制socket路径不超过104字节。
+
+CI会针对Redis 5.0、6.2、7.0以及Valkey 9.1.3运行该测试，Valkey下覆盖所有过期模式，并分别在开启和不开启AddressSanitizer的情况下运行。
 
 ## 客户端
 
