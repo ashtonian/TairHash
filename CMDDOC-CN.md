@@ -998,3 +998,10 @@ OK
 ```
 
 <br/>
+
+## 复制与持久化
+
+写命令复制的是本次写入的每个field的结果状态，而不是原始请求，因此从节点或AOF重放可以精确还原值、版本和过期时间，与其自身的时钟和状态无关。模块参数 `replication_format` 决定使用的命令：
+
+- `state`（默认）：每条写命令复制为一条内部命令 `EXHMSETREPL key 1 field value version expire [field value version expire ...]`，expire为毫秒级unix时间戳，0表示不过期。`1` 表示参数布局，节点会拒绝其不认识的布局。AOF重写输出 `EXHMSETREPL`，每条最多64个field。`EXHMSETREPL` 只接受来自复制流或加载过程的调用，普通客户端会收到 `ERR only accepted from the replication stream or while loading`（Redis 6.2之前的版本无法判断命令来源，因此总是接受）。
+- `compat`：每个field复制为一条 `EXHSET key field value ABS <version> [PXAT <expire>]`；版本为0的field（只有TairHash 1.x写入的数据会有）`EXHSET` 无法设置，复制为 `EXHSETNX key field value`。同一写命令涉及的多个field在一个MULTI/EXEC中一起复制。TairHash 1.x可以识别这些命令，升级依赖于此，见README。
