@@ -2230,4 +2230,29 @@ start_server {tags {"slab_bug_reproduce"}} {
 
         assert_equal 0 [r exhlen $key]
     }
+
+    test "Active expire removes exactly the expired fields of a partially expired key" {
+        set key "test_partial_active_expire"
+        r del $key
+
+        # Interleaved TTLs make every group of lanes in the slab expire partially.
+        for {set i 0} {$i < 64} {incr i} {
+            if {$i % 2 == 0} {
+                r exhset $key field_$i val PX 500
+            } else {
+                r exhset $key field_$i val EX 100
+            }
+        }
+
+        # EXHLEN neither triggers nor filters expiration, so only active expire can bring it to 32.
+        wait_for_condition 100 100 {
+            [r exhlen $key] == 32
+        } else {
+            fail "active expire left [r exhlen $key] fields, expected 32"
+        }
+        for {set i 1} {$i < 64} {incr i 2} {
+            assert_equal 1 [r exhexists $key field_$i]
+        }
+        r del $key
+    }
 }
