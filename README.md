@@ -23,6 +23,13 @@
 - Support field expired event notification (based on pubsub)
 - Supports last-write-wins writes and source-of-truth sync (`EXHMSETLWW`, `EXHSYNCGET`, `EXHSYNC`), so a TairHash can cache an external store without serving a partial copy; see [Last-write-wins and source-of-truth sync](CMDDOC.md#last-write-wins-and-source-of-truth-sync)
 
+## Memory
+
+Each field is one allocation holding its name, value, version, TTL and write sequence, chained
+directly into the hash table: about 80 bytes for a short field (10-byte name, 8-byte value), plus
+about 260 bytes per key. The expire index is allocated only once a field of the key gets a TTL.
+`MEMORY USAGE` reports what the allocator actually holds for a key.
+
 ## Active expiration
 ### SCAN_MODE(default):
 - Do not sort TairHash globally (Smaller memory overhead)

@@ -22,6 +22,10 @@
 - 支持field过期删除事件通知（基于pubsub）
 - 支持last-write-wins写入与数据源同步（`EXHMSETLWW`、`EXHSYNCGET`、`EXHSYNC`），使TairHash可以作为外部存储的缓存而不会返回不完整的数据，详见[CMDDOC-CN.md](CMDDOC-CN.md#last-write-wins写入与数据源同步)
 
+## 内存
+
+每个field是一次内存分配，包含名称、值、版本、过期时间和写入序号，并直接挂在哈希表的链上：短field（10字节名称、8字节值）约80字节，每个key另有约260字节。只有当key的某个field设置了过期时间时才会分配过期索引。`MEMORY USAGE` 返回分配器为该key实际持有的内存。
+
 ## 主动过期
 
 ### SCAN_MODE（扫描模式）：
