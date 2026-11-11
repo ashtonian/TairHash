@@ -196,11 +196,13 @@ m_dictType tairhashDictType = {
 
 static void tairHashTypeReleaseObject(struct tairHashObj *o) {
     m_dictRelease(o->hash);
+    if (o->expire_index) {
 #ifdef SLAB_MODE
-    slab_free(o->expire_index);
+        slab_free(o->expire_index);
 #else
-    m_zslFree(o->expire_index);
+        m_zslFree(o->expire_index);
 #endif
+    }
     if (o->key) {
         RedisModule_FreeString(NULL, o->key);
     }
@@ -210,12 +212,18 @@ static void tairHashTypeReleaseObject(struct tairHashObj *o) {
 static struct tairHashObj *createTairHashTypeObject() {
     tairHashObj *o = RedisModule_Calloc(1, sizeof(*o));
     o->hash = m_dictCreate(&tairhashDictType, NULL);
+    return o;
+}
+
+void tairHashEnsureExpireIndex(tairHashObj *o) {
+    if (o->expire_index) {
+        return;
+    }
 #ifdef SLAB_MODE
     o->expire_index = slab_create();
 #else
     o->expire_index = m_zslCreate();
 #endif
-    return o;
 }
 
 int isReadOnlyStatus(RedisModuleCtx *ctx) {
@@ -400,7 +408,7 @@ static int keySpaceNotification(RedisModuleCtx *ctx, int type, const char *event
         /* Keys of every type are renamed and moved. Only a tairhash tracks its own name,
          * and only one with expiring fields has an entry in the db expire index. */
         if (tair_hash_obj) {
-            int indexed = tair_hash_obj->expire_index->length > 0;
+            int indexed = TAIRHASH_EXPIRE_INDEX_LEN(tair_hash_obj) > 0;
             long long previous_index = 0;
             if (indexed) {
 #ifdef SLAB_MODE
@@ -2812,44 +2820,63 @@ void TairHashTypeFree(void *value) {
     }
 }
 
+/* Set at load time when the server provides RedisModule_MallocSizeString (Redis 7.0+). */
+static size_t (*g_malloc_size_string)(RedisModuleString *str) = NULL;
+
+/* Allocator size of a module string. Without RedisModule_MallocSizeString, a string
+ * longer than the 44 bytes Redis embeds in the object header has its payload in a
+ * separate allocation that only its length can approximate. */
+static size_t stringMallocSize(RedisModuleString *str) {
+    if (g_malloc_size_string) {
+        return g_malloc_size_string(str);
+    }
+    size_t len;
+    RedisModule_StringPtrLen(str, &len);
+    return RedisModule_MallocSize(str) + (len > 44 ? len + 1 : 0);
+}
+
+/* What the hash actually holds in the allocator: object, dict and bucket tables,
+ * entries, field and value strings and the expire index. Skiplist members share the
+ * dict's field strings and are not counted twice. */
+static size_t tairHashMemUsage(const tairHashObj *o) {
+    size_t size = RedisModule_MallocSize((void *)o) + RedisModule_MallocSize(o->hash);
+    for (int t = 0; t < 2; t++) {
+        if (o->hash->ht[t].table) {
+            size += RedisModule_MallocSize(o->hash->ht[t].table);
+        }
+    }
+    if (o->key) {
+        size += stringMallocSize(o->key);
+    }
+
+    m_dictIterator *di = m_dictGetIterator(o->hash);
+    m_dictEntry *de;
+    while ((de = m_dictNext(di)) != NULL) {
+        TairHashVal *val = (TairHashVal *)dictGetVal(de);
+        size += RedisModule_MallocSize(de) + stringMallocSize(dictGetKey(de)) + RedisModule_MallocSize(val) + stringMallocSize(val->value);
+    }
+    m_dictReleaseIterator(di);
+
+    if (o->expire_index) {
+        size += RedisModule_MallocSize(o->expire_index);
+#ifdef SLAB_MODE
+        for (tairhash_zskiplistNode *x = o->expire_index->header; x != NULL; x = x->level[0].forward) {
+            size += RedisModule_MallocSize(x) + (x->slab ? RedisModule_MallocSize(x->slab) : 0);
+        }
+#else
+        for (m_zskiplistNode *x = o->expire_index->header; x != NULL; x = x->level[0].forward) {
+            size += RedisModule_MallocSize(x);
+        }
+#endif
+    }
+    return size;
+}
+
 #if defined(SORT_MODE) || defined(SLAB_MODE)
 
 size_t TairHashTypeMemUsage2(RedisModuleKeyOptCtx *ctx, const void *value) {
-    tairHashObj *o = (tairHashObj *)value;
-
-    uint64_t size = 0;
-    RedisModuleString *skey;
-    size_t skeylen = 0;
-
-    if (!o) {
-        return size;
-    }
-
-    m_dictIterator *di;
-    m_dictEntry *de;
-
-    if (o->hash) {
-        size += sizeof(*o);
-
-        di = m_dictGetIterator(o->hash);
-        while ((de = m_dictNext(di)) != NULL) {
-            TairHashVal *val = (TairHashVal *)dictGetVal(de);
-            skey = dictGetKey(de);
-            size += sizeof(*val);
-            RedisModule_StringPtrLen(skey, &skeylen);
-            size += skeylen;
-            size_t len;
-            RedisModule_StringPtrLen(val->value, &len);
-            size += len;
-        }
-        m_dictReleaseIterator(di);
-    }
-
-    if (o->expire_index) {
-        size += o->expire_index->length * sizeof(m_zskiplistNode);
-    }
-
-    return size;
+    REDISMODULE_NOT_USED(ctx);
+    return value ? tairHashMemUsage((const tairHashObj *)value) : 0;
 }
 
 void TairHashTypeUnlink2(RedisModuleKeyOptCtx *ctx, const void *value) {
@@ -2857,7 +2884,7 @@ void TairHashTypeUnlink2(RedisModuleKeyOptCtx *ctx, const void *value) {
 
     int dbid = RedisModule_GetDbIdFromOptCtx(ctx);
 
-    if (o->expire_index->length) {
+    if (TAIRHASH_EXPIRE_INDEX_LEN(o)) {
         /* UNLINK is a synchronous call, so ExpireNode can be safely deleted here. */
 #ifdef SLAB_MODE
         m_zslDelete(g_expire_index[dbid], o->expire_index->header->level[0].forward->expire_min, o->key, NULL);
@@ -2900,52 +2927,18 @@ void *TairHashTypeCopy2(RedisModuleKeyOptCtx *ctx, const void *value) {
 
 size_t TairHashTypeEffort2(RedisModuleKeyOptCtx *ctx, const void *value) {
     tairHashObj *o = (tairHashObj *)value;
-    return dictSize(o->hash) + o->expire_index->length;
+    return dictSize(o->hash) + TAIRHASH_EXPIRE_INDEX_LEN(o);
 }
 #else
 
 size_t TairHashTypeMemUsage(const void *value) {
-    tairHashObj *o = (tairHashObj *)value;
-
-    uint64_t size = 0;
-    RedisModuleString *skey;
-    size_t skeylen = 0;
-
-    if (!o) {
-        return size;
-    }
-
-    m_dictIterator *di;
-    m_dictEntry *de;
-
-    if (o->hash) {
-        size += sizeof(*o);
-
-        di = m_dictGetIterator(o->hash);
-        while ((de = m_dictNext(di)) != NULL) {
-            TairHashVal *val = (TairHashVal *)dictGetVal(de);
-            skey = dictGetKey(de);
-            size += sizeof(*val);
-            RedisModule_StringPtrLen(skey, &skeylen);
-            size += skeylen;
-            size_t len;
-            RedisModule_StringPtrLen(val->value, &len);
-            size += len;
-        }
-        m_dictReleaseIterator(di);
-    }
-
-    if (o->expire_index) {
-        size += o->expire_index->length * sizeof(m_zskiplistNode);
-    }
-
-    return size;
+    return value ? tairHashMemUsage((const tairHashObj *)value) : 0;
 }
 
 size_t TairHashTypeEffort(RedisModuleString *key, const void *value) {
     REDISMODULE_NOT_USED(key);
     tairHashObj *o = (tairHashObj *)value;
-    return dictSize(o->hash) + o->expire_index->length;
+    return dictSize(o->hash) + TAIRHASH_EXPIRE_INDEX_LEN(o);
 }
 
 #endif
@@ -3125,6 +3118,10 @@ int __attribute__((visibility("default"))) RedisModule_OnLoad(RedisModuleCtx *ct
     TairHashType = RedisModule_CreateDataType(ctx, "tairhash-", 0, &tm);
     if (TairHashType == NULL)
         return REDISMODULE_ERR;
+
+    if (RedisModule_GetApi("RedisModule_MallocSizeString", (void **)&g_malloc_size_string) != REDISMODULE_OK) {
+        g_malloc_size_string = NULL;
+    }
 
     if (REDISMODULE_ERR == Module_CreateCommands(ctx)) {
         return REDISMODULE_ERR;

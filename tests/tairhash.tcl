@@ -705,6 +705,26 @@ start_server {tags {"tairhash"} overrides {bind 0.0.0.0}} {
         assert_equal 3 $h_len
     }
 
+    test {A hash without expiring fields allocates no expire index} {
+        r del plain ttl
+        r exhset plain f v
+        r exhset ttl f v ex 1000
+        r exhpersist ttl f
+        # The index, once allocated, is dominated by a 64-level skiplist header (~1KB).
+        assert_morethan [expr {[r memory usage ttl] - [r memory usage plain]}] 1000
+    }
+
+    test {MEMORY USAGE tracks the allocator} {
+        r flushall
+        set before [s used_memory]
+        for {set i 0} {$i < 2000} {incr i} {
+            r exhset big field:$i [string repeat x 12]
+        }
+        set allocated [expr {[s used_memory] - $before}]
+        set reported [r memory usage big]
+        assert_lessthan [expr {abs($reported - $allocated)}] [expr {$allocated / 10}]
+    }
+
     test {Exhdelwithver} {
         r del tairhashkey
 
