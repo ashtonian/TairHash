@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <limits.h>
 #include <stdio.h>
 
 #include "dict.h"
@@ -27,10 +28,11 @@
 #include "util.h"
 
 /* Reported to the server (MODULE LIST, INFO modules) as major * 10000 + minor * 100 + patch. */
-#define TAIRHASH_MODULE_VERSION 20000
+#define TAIRHASH_MODULE_VERSION 20100
 
-/* Encoding version of the RDB format; RDB load rejects newer encodings. */
-#define TAIRHASH_ENCVER 0
+/* Encoding version of the RDB format; RDB load rejects newer encodings. Encoding 1 adds the
+ * synced flag and each field's write sequence; encoding 0 still loads. */
+#define TAIRHASH_ENCVER 1
 
 #define TAIRHASH_ERRORMSG_SYNTAX "ERR syntax error"
 #define TAIRHASH_ERRORMSG_VERSION "ERR update version is stale"
@@ -46,9 +48,14 @@
 #define TAIRHASH_ERRORMSG_INVALID_EXPIRE "ERR invalid expire time"
 #define TAIRHASH_ERRORMSG_VERSION_OVERFLOW "ERR version would overflow"
 #define TAIRHASH_ERRORMSG_FIELD_TOO_LONG "ERR field name or value is too long"
+#define TAIRHASH_ERRORMSG_SYNC_LEASE "ERR no sync lease for this token: call EXHSYNCBEGIN again"
 
 /* Longest field name or value: a field stores both lengths in 32 bits. */
 #define TAIRHASH_FIELD_MAX_LEN UINT32_MAX
+/* Highest write sequence accepted from the replication stream or an RDB. Sequences are
+ * microsecond timestamps, so this is far beyond any real one, and far enough below LLONG_MAX
+ * that assigning later sequences cannot overflow. */
+#define TAIRHASH_SEQ_MAX (LLONG_MAX / 2)
 /* Most fields RDB load sizes the table for before reading them; larger hashes grow as they load. */
 #define TAIRHASH_RDB_PRESIZE_MAX (1UL << 24)
 
@@ -82,13 +89,43 @@
  * perform a restore on a key, the original expire will be Lost unless you specify ttl
  * again. The `version` and `expire` of tairhash will be completely recovered after the
  * restore.
+ *
+ * `seq` is the server-assigned write sequence of the field's last value write. It is
+ * strictly increasing per server across key lifetimes (see tairHashNextSeq), so EXHSYNC
+ * can tell a field written after a reader took its sync token apart from one the source
+ * of truth no longer has, independently of the caller-supplied `version`.
  */
 
 /*
  * `expire_index` is allocated on the first field that gets a TTL, so a hash that never
  * uses field expiration pays nothing for it. Use TAIRHASH_EXPIRE_INDEX_LEN to read its
  * length.
+ *
+ * `lww` holds the state of the last-write-wins and sync commands (see EXHSYNC), allocated
+ * when a hash first uses them, so other hashes pay one pointer for it.
  */
+typedef struct lwwState {
+    /* Sync epoch in which EXHSYNC last made the hash an authoritative copy of the source of
+     * truth, 0 if never. The hash is synced only while this is the current epoch, which a
+     * master renews when it loads its data or is promoted, and a replica takes from its
+     * master. A synced hash is kept even without fields, so "the source has nothing for this
+     * key" is cacheable. */
+    long long synced_epoch;
+    /* Token of the sync EXHSYNCBEGIN opened and EXHSYNC has not completed, 0 if none. Not
+     * persisted or replicated: a sync that spans a restart or a failover starts again. */
+    long long lease;
+    /* The key's TTL was set by EXHSYNCBEGIN (a placeholder) or EXHDELLWW (a hash left with
+     * only tombstones), so that an abandoned one goes away. It lasts only while the hash has
+     * no fields: the first write that adds one, or EXHSYNC, removes it. */
+    int owns_key_ttl;
+    /* Fields deleted by EXHDELLWW: the name, the delete version in `version` and the end of
+     * the retention in `expire` (unix time in milliseconds). Writes and snapshot entries
+     * with a version up to a tombstone's lose to it. */
+    fieldTable tombstones;
+    /* Tombstone count at which EXHDELLWW next drops the ones whose retention ended. */
+    size_t purge_at;
+} lwwState;
+
 typedef struct tairHashObj {
     fieldTable hash;
 #if defined SLAB_MODE
@@ -97,6 +134,7 @@ typedef struct tairHashObj {
     m_zskiplist *expire_index;
 #endif
     RedisModuleString *key;
+    lwwState *lww;
 } tairHashObj;
 
 #define TAIRHASH_EXPIRE_INDEX_LEN(o) ((o)->expire_index ? (o)->expire_index->length : 0)

@@ -27,7 +27,7 @@ start_server {tags {"tairhash replication"} overrides {bind 0.0.0.0}} {
                 set version [dict get $m ver]
             }
         }
-        assert_equal 20000 $version
+        assert_equal 20100 $version
     }
 
     test {EXHSETNX starts a new field at version 1} {

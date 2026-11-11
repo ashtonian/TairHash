@@ -20,10 +20,11 @@
 - field支持单独设置expire和version
 - 针对field支持高效的active expire和passivity expire，其中active expire支持SCAN_MODE、SORT_MODE和SLAB_MODE模式。
 - 支持field过期删除事件通知（基于pubsub）
+- 支持last-write-wins写入、删除与数据源同步（`EXHMSETLWW`、`EXHDELLWW`、`EXHSYNCGET`、`EXHSYNCBEGIN`、`EXHSYNC`），使TairHash可以作为外部存储的缓存而不会返回不完整或过期的数据，详见[CMDDOC-CN.md](CMDDOC-CN.md#last-write-wins写入与数据源同步)
 
 ## 内存
 
-每个field是一次内存分配，包含名称、值、版本和过期时间，并直接挂在哈希表的链上。一个包含30个field（名称和值均为8字节）的key总共约占1.9KB（`bench/profile.sh`，Redis 7.0，jemalloc），而每个field使用一个dict entry、一个值结构体和两个字符串对象时约为5.2KB。只有当key的某个field设置了过期时间时才会分配过期索引。`MEMORY USAGE` 返回分配器为该key实际持有的内存。
+每个field是一次内存分配，包含名称、值、版本、过期时间和写入序号，并直接挂在哈希表的链上。在TairHash 2.0中，一个包含30个field（名称和值均为8字节）的key总共约占1.9KB（`bench/profile.sh`，Redis 7.0，jemalloc），而每个field使用一个dict entry、一个值结构体和两个字符串对象时约为5.2KB；写入序号使每个field增加8字节。只有当key的某个field设置了过期时间时才会分配过期索引。`MEMORY USAGE` 返回分配器为该key实际持有的内存。
 
 ## 主动过期
 
@@ -154,17 +155,23 @@ cmake ../ && make -j
 | `active_expire_keys_per_loop` | 整数 | `1000` | 每次主动过期在每个数据库中检查的key数量（SCAN模式下为SCAN的count）。 |
 | `active_expire_dbs_per_loop` | 整数 | `16` | 每次主动过期访问的数据库数量。 |
 | `passive_expire_keys_per_loop` | 整数 | `3` | 每次被动过期检查最多删除的过期field数量。 |
+| `lww_tombstone_ttl` | 秒 | `3600` | `EXHDELLWW` 留下的墓碑阻止版本相同或更低的写入的时长。应大于删除超越其所覆盖写入所需的时间，包括同步时读取快照的时间。 |
+| `sync_lease_ttl` | 秒 | `60` | `EXHSYNCBEGIN` 租约及其为不存在的key创建的占位TairHash的存续时长。应大于从数据源读取快照所需的时间。 |
 | `replication_format` | `state` 或 `compat` | `state` | 写入如何传给从节点和AOF：`state` 每次写入发送一条内部命令 `EXHMSETREPL`（或 `EXHMETAREPL`），`compat` 每个field发送一条 `EXHSET`/`EXHSETNX`，TairHash 1.x也能识别。见[从1.x升级](#从1x升级)。在Redis 7.0+和Valkey上它同时是模块配置 `tairhash.replication_format`，可以通过 `CONFIG SET` 在运行时修改；配置文件中的值优先于加载参数。 |
+
+## 从2.0升级
+
+TairHash 2.1写入RDB编码版本1（同步状态、墓碑与每个field的写入序号，另以模块aux数据保存同步纪元，因此即使没有TairHash类型的key，其RDB也需要加载本模块），仍可加载版本0：TairHash 2.0无法加载2.1写入的RDB，因此请先升级从节点再升级主节点，如需保留降级能力请保存升级前的RDB。2.1使用 `EXHMSETREPL` 布局2复制，2.0会拒绝；在所有节点运行2.1之前请使用 `replication_format compat`，方法与下面从1.x升级相同。
 
 ## 从1.x升级
 
-TairHash 2.0把每次写入复制为一条 `EXHMSETREPL` 或 `EXHMETAREPL`，TairHash 1.x不认识这些命令：2.0主节点的1.x从节点会对每次写入记录错误并丢弃该写入。RDB编码不变。在所有节点都运行2.0之前，请使用 `replication_format compat`：
+TairHash 2.x把每次写入复制为一条 `EXHMSETREPL` 或 `EXHMETAREPL`，TairHash 1.x不认识这些命令：2.x主节点的1.x从节点会对每次写入记录错误并丢弃该写入。2.0沿用1.x的RDB编码；2.1写入包含写入序号与同步状态的新编码，1.x和2.0无法加载，因此2.1之前的节点无法从2.1节点进行全量同步。在所有节点都运行2.x之前，请使用 `replication_format compat`：
 
-1. 所有升级后的节点都以 `replication_format compat` 启动（在Redis 7.0+和Valkey上，也可以在配置文件中写 `tairhash.replication_format compat`）。先升级从节点，进行故障转移，再升级原主节点：故障转移期间1.x节点可能会从2.0节点复制，`compat` 可以保证其正常工作。
-2. 确认每个节点（包括级联的从节点）的 `MODULE LIST` 中 `tairhash` 的 `ver` 为 `20000`：从节点会原样转发其主节点的复制流，因此任意层级的从节点收到的都是顶层主节点发送的内容。
+1. 所有升级后的节点都以 `replication_format compat` 启动（在Redis 7.0+和Valkey上，也可以在配置文件中写 `tairhash.replication_format compat`）。先升级从节点，进行故障转移，再升级原主节点：故障转移期间1.x节点可能会从2.x节点复制，`compat` 可以保证其正常工作（对于2.1节点，前提是不需要全量同步，见上文）。
+2. 确认每个节点（包括级联的从节点）的 `MODULE LIST` 中 `tairhash` 的 `ver` 为 `20100`：从节点会原样转发其主节点的复制流，因此任意层级的从节点收到的都是顶层主节点发送的内容。
 3. 将所有节点切换为 `state`：在Redis 7.0+和Valkey上执行 `CONFIG SET tairhash.replication_format state`，更早的版本去掉该参数后重启。
 
-降级时，先将所有节点切换回 `compat`，再在每个节点上执行 `BGREWRITEAOF` 使其AOF中不再包含 `EXHMSETREPL` 或 `EXHMETAREPL`，然后替换模块。仍处于 `state` 的节点会把从主节点应用的写入以state格式写入自己的AOF。在Redis 7.0+和Valkey上，升级期间设置 `propagation-error-behavior panic-on-replicas` 可以让无法应用复制流的从节点直接停止，而不是静默地产生数据不一致。
+降级时，先将所有节点切换回 `compat`，再在每个节点上执行 `BGREWRITEAOF` 使其AOF中不再包含 `EXHMSETREPL` 或 `EXHMETAREPL`，然后替换模块。仍处于 `state` 的节点会把从主节点应用的写入以state格式写入自己的AOF。`EXHMSETLWW`、`EXHDELLWW` 和 `EXHSYNC` 无论该设置如何都以state格式复制，AOF重写在两种格式下都会为带有同步状态或墓碑的hash输出 `EXHSYNCREPL` 和 `EXHTOMBREPL`，因此它们都无法应用到2.1之前的节点。在Redis 7.0+和Valkey上，升级期间设置 `propagation-error-behavior panic-on-replicas` 可以让无法应用复制流的从节点直接停止，而不是静默地产生数据不一致。
 
 `EXHSETNX` 现在与 `EXHSET` 一样，新field的版本从1开始；1.x中为0，导致之后的 `VER` 检查除0以外对任何版本都会失败。
 
