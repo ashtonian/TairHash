@@ -20,6 +20,7 @@
 - field支持单独设置expire和version
 - 针对field支持高效的active expire和passivity expire，其中active expire支持SCAN_MODE、SORT_MODE和SLAB_MODE模式。
 - 支持field过期删除事件通知（基于pubsub）
+- 支持last-write-wins写入与数据源同步（`EXHMSETLWW`、`EXHSYNCGET`、`EXHSYNC`），使TairHash可以作为外部存储的缓存而不会返回不完整的数据，详见[CMDDOC-CN.md](CMDDOC-CN.md#last-write-wins写入与数据源同步)
 
 ## 主动过期
 
@@ -157,7 +158,7 @@ tests/run.sh --server-ref 7.2 -- --baseport 25000   # 其他Redis分支，附加
 
 ## 升级
 
-旧版本的从节点会拒绝此版本产生的复制流（`EXHMSETREPL`），请先升级从节点再升级主节点。RDB编码不变。
+RDB编码版本为1。此版本写入的数据无法被旧版本加载，旧版本的从节点也会拒绝此版本产生的复制流（`EXHMSETREPL`），请先升级从节点再升级主节点。编码版本0的数据可以直接加载。
 
 ## 客户端
 

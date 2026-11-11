@@ -66,16 +66,27 @@
  * will be Lost unless you specify ttl again. The `version` and `expire` of tairhash will
  * be completely recovered after the restore.
  */
+/*
+ * `seq` is the server-assigned write sequence of the field's last value write. It is
+ * strictly increasing per server across key lifetimes (see tairHashNextSeq), so EXHSYNC
+ * can tell a field written after a reader took its sync token apart from one the source
+ * of truth no longer has, independently of the caller-supplied `version`.
+ */
 typedef struct TairHashVal {
     long long version;
     long long expire;
     RedisModuleString *value;
+    long long seq;
 } TairHashVal;
 
 /*
  * `expire_index` is allocated on the first field that gets a TTL, so a hash that never
  * uses field expiration pays nothing for it. Use TAIRHASH_EXPIRE_INDEX_LEN to read its
  * length.
+ *
+ * `synced` marks the hash as an authoritative copy of an external source of truth
+ * (set by EXHSYNC). A synced hash is kept even when it has no fields, so "the source
+ * has nothing for this key" is cacheable.
  */
 typedef struct tairHashObj {
     dict *hash;
@@ -85,6 +96,7 @@ typedef struct tairHashObj {
     m_zskiplist *expire_index;
 #endif
     RedisModuleString *key;
+    int synced;
 } tairHashObj;
 
 #define TAIRHASH_EXPIRE_INDEX_LEN(o) ((o)->expire_index ? (o)->expire_index->length : 0)

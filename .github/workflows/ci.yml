@@ -85,10 +85,12 @@ jobs:
         module_path=$work_path/lib
         sed -e "s#your_path#$module_path#g" tests/tairhash.tcl > redis/tests/unit/type/tairhash.tcl
         sed -e "s#your_path#$module_path#g" tests/tairhash_replication.tcl > redis/tests/unit/type/tairhash_replication.tcl
+        sed -e "s#your_path#$module_path#g" tests/tairhash_lww.tcl > redis/tests/unit/type/tairhash_lww.tcl
         sed -i 's#unit/type/string#unit/type/tairhash#g' redis/tests/test_helper.tcl
         cd redis
         ./runtest --stack-logging --single unit/type/tairhash
         ./runtest --stack-logging --single unit/type/tairhash_replication
+        ./runtest --stack-logging --single unit/type/tairhash_lww
     - name: lcov collection
       run: |
         cd build
@@ -126,10 +128,12 @@ jobs:
         module_path=$work_path/lib
         sed -e "s#your_path#$module_path#g" tests/tairhash.tcl > redis/tests/unit/type/tairhash.tcl
         sed -e "s#your_path#$module_path#g" tests/tairhash_replication.tcl > redis/tests/unit/type/tairhash_replication.tcl
+        sed -e "s#your_path#$module_path#g" tests/tairhash_lww.tcl > redis/tests/unit/type/tairhash_lww.tcl
         sed -i 's#unit/type/string#unit/type/tairhash#g' redis/tests/test_helper.tcl
         cd redis
         ./runtest --stack-logging --single unit/type/tairhash
         ./runtest --stack-logging --single unit/type/tairhash_replication
+        ./runtest --stack-logging --single unit/type/tairhash_lww
     - name: lcov collection
       run: |
         cd build
@@ -167,10 +171,12 @@ jobs:
         module_path=$work_path/lib
         sed -e "s#your_path#$module_path#g" tests/tairhash.tcl > redis/tests/unit/type/tairhash.tcl
         sed -e "s#your_path#$module_path#g" tests/tairhash_replication.tcl > redis/tests/unit/type/tairhash_replication.tcl
+        sed -e "s#your_path#$module_path#g" tests/tairhash_lww.tcl > redis/tests/unit/type/tairhash_lww.tcl
         sed -i 's#unit/type/string#unit/type/tairhash#g' redis/tests/test_helper.tcl
         cd redis
         ./runtest --stack-logging --single unit/type/tairhash
         ./runtest --stack-logging --single unit/type/tairhash_replication
+        ./runtest --stack-logging --single unit/type/tairhash_lww
     - name: lcov collection
       run: |
         cd build
@@ -208,10 +214,12 @@ jobs:
         module_path=$work_path/lib
         sed -e "s#your_path#$module_path#g" tests/tairhash.tcl > redis/tests/unit/type/tairhash.tcl
         sed -e "s#your_path#$module_path#g" tests/tairhash_replication.tcl > redis/tests/unit/type/tairhash_replication.tcl
+        sed -e "s#your_path#$module_path#g" tests/tairhash_lww.tcl > redis/tests/unit/type/tairhash_lww.tcl
         sed -i 's#unit/type/string#unit/type/tairhash#g' redis/tests/test_helper.tcl
         cd redis
         ./runtest --stack-logging --single unit/type/tairhash
         ./runtest --stack-logging --single unit/type/tairhash_replication
+        ./runtest --stack-logging --single unit/type/tairhash_lww
     - name: lcov collection
       run: |
         cd build
@@ -249,10 +257,12 @@ jobs:
         module_path=$work_path/lib
         sed -e "s#your_path#$module_path#g" tests/tairhash.tcl > redis/tests/unit/type/tairhash.tcl
         sed -e "s#your_path#$module_path#g" tests/tairhash_replication.tcl > redis/tests/unit/type/tairhash_replication.tcl
+        sed -e "s#your_path#$module_path#g" tests/tairhash_lww.tcl > redis/tests/unit/type/tairhash_lww.tcl
         sed -i 's#unit/type/string#unit/type/tairhash#g' redis/tests/test_helper.tcl
         cd redis
         ./runtest --stack-logging --single unit/type/tairhash
         ./runtest --stack-logging --single unit/type/tairhash_replication
+        ./runtest --stack-logging --single unit/type/tairhash_lww
     - name: lcov collection
       run: |
         cd build

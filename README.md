@@ -21,6 +21,7 @@
 - Supports setting expiration and version for field
 - Support efficient active expiration (SCAN mode, SORT mode and SLAB mode) and passivity expiration for field
 - Support field expired event notification (based on pubsub)
+- Supports last-write-wins writes and source-of-truth sync (`EXHMSETLWW`, `EXHSYNCGET`, `EXHSYNC`), so a TairHash can cache an external store without serving a partial copy; see [Last-write-wins and source-of-truth sync](CMDDOC.md#last-write-wins-and-source-of-truth-sync)
 
 ## Active expiration
 ### SCAN_MODE(default):
@@ -167,8 +168,9 @@ To run a suite by hand instead: replace `your_path` in the suite with the direct
 
 ## Upgrading
 
-Older replicas reject the replication stream this version produces (`EXHMSETREPL`):
-upgrade replicas before their master. The RDB encoding is unchanged.
+The RDB encoding version is 1. Data written by this version can not be loaded by older
+builds, and older replicas reject the replication stream it produces (`EXHMSETREPL`):
+upgrade replicas before their master. Version 0 data loads unchanged.
 
 
 ## Client

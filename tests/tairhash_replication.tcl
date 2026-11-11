@@ -5,7 +5,7 @@ start_server {tags {"tairhash replication"} overrides {bind 0.0.0.0}} {
 
     test {Replication-only commands are rejected from clients} {
         r del k
-        assert_error {*replication stream*} {r exhmsetrepl k f v 1 0}
+        assert_error {*replication stream*} {r exhmsetrepl k f v 1 0 1}
         assert_error {*syntax*} {r exhset k f v abs 0}
         assert_equal 0 [r exists k]
     }
