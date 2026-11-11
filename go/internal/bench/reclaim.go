@@ -33,6 +33,21 @@ type ReclaimConfig struct {
 	Placement string
 }
 
+// reclaimWindowLead is how long before the deadline the reclaim window opens.
+// It must exceed the time ResetDiagnostics and a full snapshot take.
+const reclaimWindowLead = 500 * time.Millisecond
+
+func sleepUntil(ctx context.Context, t time.Time) error {
+	timer := time.NewTimer(time.Until(t))
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // ReclaimSample is one point of the reclamation timeline.
 type ReclaimSample struct {
 	AfterDeadlineSec float64 `json:"after_deadline_sec"`
@@ -71,8 +86,9 @@ type ReclaimResult struct {
 	ReclaimSec    float64 `json:"reclaim_sec"`
 	RemainingKeys int64   `json:"remaining_keys"`
 	FieldsPerSec  float64 `json:"fields_per_sec"`
-	// Server covers the deadline until the data was gone (or the timeout),
-	// including client-driven sweeping; per-op figures are per field reclaimed.
+	// Server covers the window from just before the deadline until the data
+	// was gone (or the timeout), including client-driven sweeping, net of the
+	// harness's own polling; per-op figures are per field reclaimed.
 	Server      ServerMetrics   `json:"server_metrics"`
 	SweepCalls  int64           `json:"sweep_calls,omitempty"`
 	SweptFields int64           `json:"swept_fields,omitempty"`
@@ -147,16 +163,24 @@ func Reclaim(ctx context.Context, srv *Server, b Backend, ks *Keyspace, cfg Recl
 		}
 	}
 
-	select {
-	case <-time.After(time.Until(deadline)):
-	case <-ctx.Done():
-		return res, ctx.Err()
+	// The measured window opens shortly before the deadline so it holds all of
+	// the reclamation work: a fast active-expire timer starts within
+	// milliseconds of the deadline, before a snapshot taken after it would
+	// return. Nothing can expire earlier, so the lead adds only idle time.
+	if err := sleepUntil(ctx, deadline.Add(-reclaimWindowLead)); err != nil {
+		return res, err
 	}
 	if err := srv.ResetDiagnostics(ctx); err != nil {
 		return res, err
 	}
 	atDeadline, err := srv.Snapshot(ctx)
 	if err != nil {
+		return res, err
+	}
+	if late := time.Since(deadline); late > 0 {
+		return res, fmt.Errorf("reclaim window opened %s after the deadline, so it misses reclamation work; raise -lease", late)
+	}
+	if err := sleepUntil(ctx, deadline); err != nil {
 		return res, err
 	}
 
@@ -216,7 +240,7 @@ func Reclaim(ctx context.Context, srv *Server, b Backend, ks *Keyspace, cfg Recl
 		dt := now.Sub(prevAt).Seconds()
 		sample := ReclaimSample{AfterDeadlineSec: now.Sub(deadline).Seconds(), Keys: keys, UsedMemory: int64(infoFloat(cur, "used_memory"))}
 		if dt > 0 {
-			sample.Utilization = (infoFloat(cur, "used_active_time_main_thread") - infoFloat(prev, "used_active_time_main_thread")) / dt
+			sample.Utilization = busyRate(prev, cur, dt)
 			sample.ExpiredPerSec = (infoFloat(cur, "expired_fields") - infoFloat(prev, "expired_fields")) / dt
 		}
 		res.Timeline = append(res.Timeline, sample)

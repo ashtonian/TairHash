@@ -11,17 +11,23 @@ import (
 type ServerMetrics struct {
 	WindowSec float64 `json:"window_sec"`
 
-	// ActiveMainSec is Δused_active_time_main_thread: time the main thread did
-	// work rather than wait in the event loop. Every command runs on it, so it
-	// bounds throughput.
-	ActiveMainSec float64 `json:"active_main_sec"`
-	CPUUserSec    float64 `json:"cpu_user_sec"`
-	CPUSysSec     float64 `json:"cpu_sys_sec"`
-	// Utilization is ActiveMainSec over the window; near 1 the server was the
+	// BusyMainSec is Δeventloop_duration_sum: the processing time of every
+	// event-loop iteration, from wakeup to the next sleep. Every command runs on
+	// the main thread, so it bounds throughput. used_active_time_main_thread is
+	// not used: it skips iterations without client I/O, which is where module
+	// timers and cron-driven expiry do their work.
+	BusyMainSec float64 `json:"busy_main_sec"`
+	// HarnessSec is the execution time of the bench's own commands in the
+	// window (snapshots, polling), from commandstats. BusyUsPerOp excludes it.
+	HarnessSec float64 `json:"harness_sec"`
+	CPUUserSec float64 `json:"cpu_user_sec"`
+	CPUSysSec  float64 `json:"cpu_sys_sec"`
+	// Utilization is BusyMainSec over the window; near 1 the server was the
 	// bottleneck, well below it the client or the round trip was.
-	Utilization   float64 `json:"utilization"`
-	ActiveUsPerOp float64 `json:"active_us_per_op"`
-	CPUUsPerOp    float64 `json:"cpu_us_per_op"`
+	Utilization float64 `json:"utilization"`
+	// BusyUsPerOp is main-thread time per operation net of harness commands.
+	BusyUsPerOp float64 `json:"busy_us_per_op"`
+	CPUUsPerOp  float64 `json:"cpu_us_per_op"`
 
 	EventLoop EventLoopMetrics `json:"eventloop"`
 	IO        IOMetrics        `json:"io"`
@@ -129,6 +135,22 @@ type TimelineStats struct {
 	CmdRateMax      float64 `json:"cmd_rate_max"`
 }
 
+// harnessCommands are issued by the bench itself (snapshots, timeline, polling,
+// resets). Their execution time is subtracted from per-op cost and they are
+// left out of per-command tables.
+var harnessCommands = map[string]bool{
+	"info": true, "dbsize": true, "config|resetstat": true, "config|get": true, "slowlog|reset": true,
+	"slowlog|get": true, "latency|reset": true, "latency|latest": true, "latency|history": true,
+	"module|list": true, "exhexpireinfo": true, "memory|stats": true, "memory|usage": true, "ping": true,
+	"hello": true, "client|setinfo": true, "select": true, "function|load": true, "flushdb": true,
+	"command|info": true, "exhlen": true,
+}
+
+// busyRate is main-thread utilization between two INFO samples dt seconds apart.
+func busyRate(prev, cur map[string]string, dt float64) float64 {
+	return (infoFloat(cur, "eventloop_duration_sum") - infoFloat(prev, "eventloop_duration_sum")) / 1e6 / dt
+}
+
 // Measure derives ServerMetrics from snapshots bracketing a window of ops
 // operations on database db. before must follow ResetDiagnostics so the
 // commandstats and latencystats in after cover only the window.
@@ -136,7 +158,7 @@ func Measure(before, after Snapshot, ops int64, db int) (ServerMetrics, error) {
 	window := after.At.Sub(before.At)
 	m := ServerMetrics{
 		WindowSec:     window.Seconds(),
-		ActiveMainSec: after.float("used_active_time_main_thread") - before.float("used_active_time_main_thread"),
+		BusyMainSec:   float64(after.int("eventloop_duration_sum")-before.int("eventloop_duration_sum")) / 1e6,
 		CPUUserSec:    after.float("used_cpu_user") - before.float("used_cpu_user"),
 		CPUSysSec:     after.float("used_cpu_sys") - before.float("used_cpu_sys"),
 		Commands:      after.int("total_commands_processed") - before.int("total_commands_processed"),
@@ -150,7 +172,7 @@ func Measure(before, after Snapshot, ops int64, db int) (ServerMetrics, error) {
 		Errors:   after.errorStats(),
 	}
 	if window > 0 {
-		m.Utilization = m.ActiveMainSec / window.Seconds()
+		m.Utilization = m.BusyMainSec / window.Seconds()
 	}
 	m.EventLoop = EventLoopMetrics{
 		Cycles:          after.int("eventloop_cycles") - before.int("eventloop_cycles"),
@@ -197,6 +219,9 @@ func Measure(before, after Snapshot, ops int64, db int) (ServerMetrics, error) {
 			cm.CallsPerOp = float64(st.Calls) / float64(ops)
 		}
 		m.PerCommand[name] = cm
+		if harnessCommands[name] {
+			m.HarnessSec += float64(st.Usec) / 1e6
+		}
 	}
 
 	if a1, p1, ok := moduleExpireCounts(after.ModuleExpire, db); ok {
@@ -209,7 +234,7 @@ func Measure(before, after Snapshot, ops int64, db int) (ServerMetrics, error) {
 
 	if ops > 0 {
 		n := float64(ops)
-		m.ActiveUsPerOp = m.ActiveMainSec * 1e6 / n
+		m.BusyUsPerOp = (m.BusyMainSec - m.HarnessSec) * 1e6 / n
 		m.CPUUsPerOp = (m.CPUUserSec + m.CPUSysSec) * 1e6 / n
 		m.CommandsPerOp = float64(m.Commands) / n
 		m.EventLoop.UsPerOp = float64(m.EventLoop.DurationUs) / n

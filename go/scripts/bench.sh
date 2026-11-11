@@ -14,6 +14,7 @@
 #   PLAIN_PORT       plain server port (default 26379)
 #   MODULE_PORT      module server port (default 26380)
 #   RECLAIM_ARGS     extra thbench reclaim flags
+#   SKIP_LOAD=1      skip the load sweep (for example a reclaim-only pass with other MODULE_ARGS)
 #   SKIP_RECLAIM=1   skip the reclaim scenario
 #   SKIP_PROFILE=1   skip the profiled pass (client pprof + server sample/perf)
 #   CLIENT_QOS       macOS QoS clamp for the client (default utility; empty disables)
@@ -98,7 +99,7 @@ for port in "$plain_port" "$module_port"; do
 done
 
 backends="module@127.0.0.1:$module_port,lua@127.0.0.1:$plain_port,native@127.0.0.1:$plain_port"
-uptime | tee "$out/host-load.txt"
+uptime | tee -a "$out/host-load.txt"
 echo "label: $label" | tee -a "$out/host-load.txt"
 echo "placement: $placement" | tee -a "$out/host-load.txt"
 
@@ -106,15 +107,17 @@ profile_flag=(-profile)
 [[ -n "${SKIP_PROFILE:-}" ]] && profile_flag=()
 
 status=0
-"${client_cmd[@]+"${client_cmd[@]}"}" "$thbench" run -flush -backends "$backends" -out "$out/results.jsonl" \
-  -artifacts-dir "$out/runs" -label "$label" -placement "$placement" "${profile_flag[@]+"${profile_flag[@]}"}" "$@" \
-  2> >(tee "$out/run.log" >&2) || status=$?
+if [[ -z "${SKIP_LOAD:-}" ]]; then
+  "${client_cmd[@]+"${client_cmd[@]}"}" "$thbench" run -flush -backends "$backends" -out "$out/results.jsonl" \
+    -artifacts-dir "$out/runs" -label "$label" -placement "$placement" "${profile_flag[@]+"${profile_flag[@]}"}" "$@" \
+    2> >(tee -a "$out/run.log" >&2) || status=$?
+fi
 
 if [[ $status -eq 0 && -z "${SKIP_RECLAIM:-}" ]]; then
   # shellcheck disable=SC2086 # RECLAIM_ARGS is a word list by design
   "${client_cmd[@]+"${client_cmd[@]}"}" "$thbench" reclaim -flush -backends "$backends" -out "$out/results.jsonl" \
     -artifacts-dir "$out/runs" -label "$label" -placement "$placement" ${RECLAIM_ARGS:-} \
-    2> >(tee "$out/reclaim.log" >&2) || status=$?
+    2> >(tee -a "$out/reclaim.log" >&2) || status=$?
 fi
 
 uptime | tee -a "$out/host-load.txt"

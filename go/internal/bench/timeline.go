@@ -66,7 +66,7 @@ func startSampler(ctx context.Context, srv *Server, every time.Duration) *sample
 			rate := func(key string) float64 { return (infoFloat(cur, key) - infoFloat(prev, key)) / dt }
 			s.samples = append(s.samples, TimelineSample{
 				TSec:          now.Sub(start).Seconds(),
-				Utilization:   rate("used_active_time_main_thread"),
+				Utilization:   busyRate(prev, cur, dt),
 				CPUPerSec:     rate("used_cpu_user") + rate("used_cpu_sys"),
 				CmdPerSec:     rate("total_commands_processed"),
 				CyclesPerSec:  rate("eventloop_cycles"),

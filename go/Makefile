@@ -1,6 +1,6 @@
 # Build, test and benchmark the Go driver and fieldhash backends.
 #
-#   make valkey          build the pinned Valkey into .cache
+#   make valkey          build the pinned Valkey into .cache (VALKEY_MALLOC=jemalloc|libc)
 #   make module          build the TairHash module (MODULE_MODE=scan|sort|slab) from MODULE_SRC
 #   make test            unit tests only (no server)
 #   make test-integration  start a throwaway server with the module and run every test
@@ -12,6 +12,12 @@ CACHE          := .cache
 VALKEY_DIR     := $(CACHE)/valkey-$(VALKEY_VERSION)
 VALKEY_SERVER  := $(VALKEY_DIR)/src/valkey-server
 VALKEY_CLI     := $(VALKEY_DIR)/src/valkey-cli
+# Valkey defaults to libc malloc on macOS and jemalloc on Linux. Allocation is a
+# large share of the module's and Lua's cost and a small share of native's, so
+# the allocator is pinned on every platform: production Valkey runs jemalloc.
+# The stamp records the allocator the binary was built with.
+VALKEY_MALLOC  ?= jemalloc
+VALKEY_STAMP   := $(VALKEY_DIR)/.thbench-malloc-$(VALKEY_MALLOC)
 
 # TairHash source tree the module is built from. Point this at another checkout
 # to benchmark a different module revision.
@@ -35,12 +41,15 @@ endif
 
 .PHONY: valkey module test test-integration lint bench report clean
 
-valkey: $(VALKEY_SERVER)
+valkey: $(VALKEY_STAMP)
 
-$(VALKEY_SERVER):
+# Valkey's build saves its settings and rebuilds from scratch when MALLOC changes.
+$(VALKEY_STAMP):
 	mkdir -p $(CACHE)
 	test -d $(VALKEY_DIR) || git clone --depth 1 --branch $(VALKEY_VERSION) https://github.com/valkey-io/valkey.git $(VALKEY_DIR)
-	$(MAKE) -C $(VALKEY_DIR) BUILD_TLS=no
+	$(MAKE) -C $(VALKEY_DIR) BUILD_TLS=no MALLOC=$(VALKEY_MALLOC)
+	rm -f $(VALKEY_DIR)/.thbench-malloc-*
+	touch $@
 
 # The module's CMakeLists writes into $(MODULE_SRC)/lib whatever the mode, so the
 # result is copied to a per-mode path. CMAKE_POLICY_VERSION_MINIMUM lets CMake 4
@@ -57,7 +66,7 @@ module:
 test:
 	go test -race ./...
 
-test-integration: $(VALKEY_SERVER)
+test-integration: $(VALKEY_STAMP)
 	@test -f $(MODULE_SO) || $(MAKE) module
 	@dir=$$(mktemp -d); \
 	scripts/valkey-server.sh $(TEST_PORT) $$dir --loadmodule $(MODULE_SO) & pid=$$!; \
@@ -70,7 +79,7 @@ lint:
 	go vet ./...
 	shellcheck scripts/*.sh
 
-bench: $(VALKEY_SERVER)
+bench: $(VALKEY_STAMP)
 	@test -f $(MODULE_SO) || $(MAKE) module
 	MODULE_SO=$(MODULE_SO) scripts/bench.sh $(OUT) $(BENCH_FLAGS)
 

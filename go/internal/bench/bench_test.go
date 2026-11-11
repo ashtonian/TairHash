@@ -10,7 +10,7 @@ import (
 )
 
 func TestParseInfo(t *testing.T) {
-	raw := "# CPU\r\nused_cpu_sys:0.339371\r\nused_active_time_main_thread:0.000269\r\n\r\n# Commandstats\r\n" +
+	raw := "# CPU\r\nused_cpu_sys:0.339371\r\neventloop_duration_sum:269\r\n\r\n# Commandstats\r\n" +
 		"cmdstat_fcall:calls=3,usec=51,usec_per_call=17.00,rejected_calls=1,failed_calls=2\r\n" +
 		"cmdstat_config|resetstat:calls=1,usec=48,usec_per_call=48.00,rejected_calls=0,failed_calls=0\r\n" +
 		"# Latencystats\r\nlatency_percentiles_usec_fcall:p50=12.031,p99=40.191,p99.9=80.383\r\n" +
@@ -29,32 +29,35 @@ func TestParseInfo(t *testing.T) {
 func TestMeasure(t *testing.T) {
 	t0 := time.Unix(100, 0)
 	before := Snapshot{At: t0, Info: map[string]string{
-		"used_active_time_main_thread": "1.0", "used_cpu_user": "2.0", "used_cpu_sys": "1.0",
+		"used_cpu_user": "2.0", "used_cpu_sys": "1.0",
 		"total_commands_processed": "100", "eventloop_cycles": "10", "eventloop_duration_sum": "1000",
 		"eventloop_duration_cmd_sum": "400", "total_reads_processed": "50", "total_writes_processed": "50",
 		"total_net_input_bytes": "1000", "total_net_output_bytes": "500", "used_memory": "1000",
 		"used_memory_dataset": "100",
 	}}
 	after := Snapshot{At: t0.Add(2 * time.Second), Info: map[string]string{
-		"used_active_time_main_thread": "2.0", "used_cpu_user": "3.0", "used_cpu_sys": "1.5",
-		"total_commands_processed": "3100", "eventloop_cycles": "110", "eventloop_duration_sum": "4000",
-		"eventloop_duration_cmd_sum": "2400", "total_reads_processed": "150", "total_writes_processed": "130",
+		"used_cpu_user": "3.0", "used_cpu_sys": "1.5",
+		"total_commands_processed": "3100", "eventloop_cycles": "110", "eventloop_duration_sum": "1001000",
+		"eventloop_duration_cmd_sum": "800400", "total_reads_processed": "150", "total_writes_processed": "130",
 		"total_net_input_bytes": "61000", "total_net_output_bytes": "20500", "used_memory": "5000",
 		"used_memory_dataset": "2100", "db9": "keys=10,expires=0,avg_ttl=0",
 		"cmdstat_fcall":                  "calls=1000,usec=8000,usec_per_call=8.00,rejected_calls=0,failed_calls=0",
+		"cmdstat_info":                   "calls=2,usec=100000,usec_per_call=50000.00,rejected_calls=0,failed_calls=0",
 		"latency_percentiles_usec_fcall": "p50=7.0,p99=20.0,p99.9=30.0",
 	}}
 	m, err := Measure(before, after, 1000, 9)
 	require.NoError(t, err)
 
 	assert.InDelta(t, 2.0, m.WindowSec, 1e-9)
+	assert.InDelta(t, 1.0, m.BusyMainSec, 1e-9)
 	assert.InDelta(t, 0.5, m.Utilization, 1e-9)
-	assert.InDelta(t, 1000, m.ActiveUsPerOp, 1e-9)
+	assert.InDelta(t, 0.1, m.HarnessSec, 1e-9, "harness INFO time is accounted")
+	assert.InDelta(t, 900, m.BusyUsPerOp, 1e-9, "per-op cost excludes harness commands")
 	assert.InDelta(t, 1500, m.CPUUsPerOp, 1e-9)
 	assert.InDelta(t, 3.0, m.CommandsPerOp, 1e-9)
-	assert.InDelta(t, 3.0, m.EventLoop.UsPerOp, 1e-9)
-	assert.InDelta(t, 2.0, m.EventLoop.CmdUsPerOp, 1e-9)
-	assert.InDelta(t, 1.0, m.EventLoop.NonCmdUsPerOp, 1e-9)
+	assert.InDelta(t, 1000, m.EventLoop.UsPerOp, 1e-9)
+	assert.InDelta(t, 800, m.EventLoop.CmdUsPerOp, 1e-9)
+	assert.InDelta(t, 200, m.EventLoop.NonCmdUsPerOp, 1e-9)
 	assert.InDelta(t, 10.0, m.EventLoop.OpsPerCycle, 1e-9)
 	assert.InDelta(t, 0.1, m.IO.ReadsPerOp, 1e-9)
 	assert.InDelta(t, 60.0, m.IO.InBytesPerOp, 1e-9)
@@ -90,9 +93,9 @@ func TestMedianAndSpread(t *testing.T) {
 
 func TestReportExcludesProfiledRuns(t *testing.T) {
 	loads := []Result{
-		{Workload: "get", Concurrency: 16, Backend: "module", OpsPerSec: 100, Server: ServerMetrics{ActiveUsPerOp: 2}},
-		{Workload: "get", Concurrency: 16, Backend: "lua", OpsPerSec: 50, Server: ServerMetrics{ActiveUsPerOp: 5}},
-		{Workload: "get", Concurrency: 16, Backend: "lua", OpsPerSec: 1, Profiled: true, Server: ServerMetrics{ActiveUsPerOp: 99}},
+		{Workload: "get", Concurrency: 16, Backend: "module", OpsPerSec: 100, Server: ServerMetrics{BusyUsPerOp: 2}},
+		{Workload: "get", Concurrency: 16, Backend: "lua", OpsPerSec: 50, Server: ServerMetrics{BusyUsPerOp: 5}},
+		{Workload: "get", Concurrency: 16, Backend: "lua", OpsPerSec: 1, Profiled: true, Server: ServerMetrics{BusyUsPerOp: 99}},
 	}
 	var out strings.Builder
 	require.NoError(t, Report(&out, loads, nil))

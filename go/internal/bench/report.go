@@ -14,16 +14,6 @@ import (
 // ReferenceBackend is the baseline other backends are compared against.
 const ReferenceBackend = "module"
 
-// harnessCommands are issued by the bench itself (snapshots, timeline, resets)
-// and are left out of per-command tables.
-var harnessCommands = map[string]bool{
-	"info": true, "dbsize": true, "config|resetstat": true, "config|get": true, "slowlog|reset": true,
-	"slowlog|get": true, "latency|reset": true, "latency|latest": true, "latency|history": true,
-	"module|list": true, "exhexpireinfo": true, "memory|stats": true, "memory|usage": true, "ping": true,
-	"hello": true, "client|setinfo": true, "select": true, "function|load": true, "flushdb": true,
-	"command|info": true, "exhlen": true,
-}
-
 type cell struct {
 	label       string
 	workload    string
@@ -222,7 +212,7 @@ func writeClientTable(b *strings.Builder, cells []cell, aggs map[cell]*aggregate
 
 func writeServerTable(b *strings.Builder, cells []cell, aggs map[cell]*aggregate) {
 	b.WriteString("\n**Server cost per op** (median; event loop split into command execution and everything else)\n\n")
-	b.WriteString("| conc | backend | active µs | vs module (paired) | CPU µs | util (timeline min–max) | loop µs | cmd µs | other µs | ops/cycle | reads/op | writes/op | B in | B out | cmds/op | slowlog | errors |\n")
+	b.WriteString("| conc | backend | busy µs | vs module (paired) | CPU µs | util (timeline min–max) | loop µs | cmd µs | other µs | ops/cycle | reads/op | writes/op | B in | B out | cmds/op | slowlog | errors |\n")
 	b.WriteString("|---:|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, c := range cells {
 		a := aggs[c]
@@ -230,7 +220,7 @@ func writeServerTable(b *strings.Builder, cells []cell, aggs map[cell]*aggregate
 			continue
 		}
 		ref := aggs[cell{c.label, c.workload, c.concurrency, ReferenceBackend}]
-		active := func(r Result) float64 { return r.Server.ActiveUsPerOp }
+		busy := func(r Result) float64 { return r.Server.BusyUsPerOp }
 		var tlMin, tlMax []float64
 		var slow, errs int64
 		for _, r := range a.runs {
@@ -240,7 +230,7 @@ func writeServerTable(b *strings.Builder, cells []cell, aggs map[cell]*aggregate
 			errs += r.Server.ErrorReplies
 		}
 		fmt.Fprintf(b, "| %d | %s | %.2f | %s | %.2f | %.2f (%.2f–%.2f) | %.2f | %.2f | %.2f | %.1f | %.3f | %.3f | %.0f | %.0f | %.2f | %d | %d |\n",
-			c.concurrency, c.backend, a.med(active), pairedRatio(a, ref, active),
+			c.concurrency, c.backend, a.med(busy), pairedRatio(a, ref, busy),
 			a.med(func(r Result) float64 { return r.Server.CPUUsPerOp }),
 			a.med(func(r Result) float64 { return r.Server.Utilization }), median(tlMin), median(tlMax),
 			a.med(func(r Result) float64 { return r.Server.EventLoop.UsPerOp }),
@@ -341,7 +331,7 @@ func writeReclaim(b *strings.Builder, reclaims []ReclaimResult) {
 		return
 	}
 	b.WriteString("\n## reclaim — every field expires at one deadline; nothing reads them afterwards\n\n")
-	b.WriteString("| label | backend | fields | used_memory B/field | dataset B/field | MEMORY USAGE B/field | load s | reclaimed | reclaim s | fields/s | active s | active µs/field | server expired_fields | module active/passive | sweeps | latency events |\n")
+	b.WriteString("| label | backend | fields | used_memory B/field | dataset B/field | MEMORY USAGE B/field | load s | reclaimed | reclaim s | fields/s | busy s | busy µs/field | server expired_fields | module active/passive | sweeps | latency events |\n")
 	b.WriteString("|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---|---:|---|\n")
 	for _, r := range reclaims {
 		reclaimed := "yes"
@@ -358,7 +348,7 @@ func writeReclaim(b *strings.Builder, reclaims []ReclaimResult) {
 		}
 		fmt.Fprintf(b, "| %s | %s | %d | %.0f | %.0f | %.0f | %.1f | %s | %.1f | %.0f | %.3f | %.2f | %d | %s | %d | %s |\n",
 			r.Label, r.Backend, r.Keys*r.Fields, r.BytesPerField, r.DatasetBytesPerField, r.MemoryUsagePerField,
-			r.LoadSec, reclaimed, r.ReclaimSec, r.FieldsPerSec, r.Server.ActiveMainSec, r.Server.ActiveUsPerOp,
+			r.LoadSec, reclaimed, r.ReclaimSec, r.FieldsPerSec, r.Server.BusyMainSec-r.Server.HarnessSec, r.Server.BusyUsPerOp,
 			r.Server.ExpiredFields, module, r.SweepCalls, strings.Join(events, ", "))
 	}
 }

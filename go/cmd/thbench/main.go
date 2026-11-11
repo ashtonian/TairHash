@@ -293,7 +293,7 @@ func runCmd(ctx context.Context, log *slog.Logger, args []string) error {
 						slog.String("label", res.Label), slog.String("run", res.Run), slog.Bool("profiled", profiled),
 						slog.Float64("ops_per_sec", res.OpsPerSec),
 						slog.Float64("p50_us", res.Latency.P50), slog.Float64("p99_us", res.Latency.P99),
-						slog.Float64("server_active_us_per_op", res.Server.ActiveUsPerOp),
+						slog.Float64("server_busy_us_per_op", res.Server.BusyUsPerOp),
 						slog.Float64("server_utilization", res.Server.Utilization),
 						slog.Float64("eventloop_cmd_us_per_op", res.Server.EventLoop.CmdUsPerOp),
 						slog.Float64("ops_per_cycle", res.Server.EventLoop.OpsPerCycle),
@@ -353,7 +353,7 @@ func reclaimCmd(ctx context.Context, log *slog.Logger, args []string) error {
 			slog.Float64("reclaim_sec", res.ReclaimSec), slog.Float64("fields_per_sec", res.FieldsPerSec),
 			slog.Float64("bytes_per_field", res.BytesPerField),
 			slog.Float64("memory_usage_per_field", res.MemoryUsagePerField),
-			slog.Float64("server_active_us_per_field", res.Server.ActiveUsPerOp),
+			slog.Float64("server_busy_us_per_field", res.Server.BusyUsPerOp),
 			slog.Int64("server_expired_fields", res.Server.ExpiredFields),
 			slog.Int64("module_active_expired", res.Server.ModuleActiveExpired),
 			slog.Int64("remaining_keys", res.RemainingKeys))

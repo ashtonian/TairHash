@@ -113,6 +113,7 @@ These are the module's actual behaviours, confirmed against `src/tairhash.c`. A 
 |---|---|---|---|
 | `VALKEY_ADDR` | unset | tests | Integration tests skip unless set. Each test package owns one database (10–14, see `internal/testserver`) and flushes it. |
 | `VALKEY_VERSION` | `9.1.3` | make, scripts | Pinned Valkey tag built into `.cache/`. |
+| `VALKEY_MALLOC` | `jemalloc` | make | Allocator Valkey is built with, on every platform. Valkey's own default is libc malloc on macOS, where every allocation and free also pays a `malloc_size` lookup. That falls hardest on the module and Lua, whose operations allocate the most. Production Valkey runs jemalloc. Changing it triggers a full rebuild. `server.mem_allocator` in each result records which one ran. |
 | `VALKEY_SERVER` | `.cache/valkey-$VALKEY_VERSION/src/valkey-server` | `scripts/valkey-server.sh` | Server binary override. |
 | `MODULE_SRC` | `..` | make | TairHash tree the module is built from. Each tree gets its own CMake build directory under `.cache/module-<mode>/`; the loaded `.so` and `source-revision` (commit plus `git status`) are per mode. |
 | `MODULE_MODE` | `scan` | make | `scan`, `sort` or `slab` active-expire algorithm. |
@@ -123,6 +124,7 @@ These are the module's actual behaviours, confirmed against `src/tairhash.c`. A 
 | `CLIENT_CPUS` / `SERVER_CPUS` | unset | `scripts/bench.sh` (Linux) | `taskset -c` CPU lists for the client and for both servers. Give the server cores of its own. |
 | `PLAIN_PORT` / `MODULE_PORT` | `26379` / `26380` | `scripts/bench.sh` | Ports of the plain and module servers. |
 | `RECLAIM_ARGS` | `""` | `scripts/bench.sh` | Extra `thbench reclaim` flags. |
+| `SKIP_LOAD` | unset | `scripts/bench.sh` | Set to skip the load sweep, for a reclaim-only pass into an existing `OUT` (see [Build / Run / Test](#build--run--test)). |
 | `SKIP_RECLAIM` | unset | `scripts/bench.sh` | Set to skip the reclaim scenario. |
 | `SKIP_PROFILE` | unset | `scripts/bench.sh` | Set to skip the profiled pass. |
 | `TEST_PORT` | `26999` | `make test-integration` | Port of the throwaway test server. |
@@ -217,7 +219,7 @@ The client reloads the library automatically if the server loses it (`FUNCTION F
 ## Build / Run / Test
 
 ```sh
-make valkey                    # pinned Valkey into .cache/
+make valkey                    # pinned Valkey into .cache/ (jemalloc)
 make module                    # TairHash module (MODULE_MODE=scan|sort|slab, MODULE_SRC=..)
 make test                      # unit tests, no server
 make test-integration          # throwaway server with the module, every test with -race
@@ -236,9 +238,17 @@ make report OUT=bench/results/run1
 - `runs/<label dir>/<run>/`
 - `run.log` and `reclaim.log`
 - the server logs
-- `host-load.txt`: the host load before and after, the label, and the CPU placement
+- `host-load.txt`: the host load before and after each pass, the label, and the CPU placement (appended across passes)
 
 The client runs under the placement described by `CLIENT_QOS` (macOS) or `CLIENT_CPUS`/`SERVER_CPUS` (Linux). Each result records it. If a phase fails, the script skips the remaining phases, still renders `report.md` from the results recorded so far, and exits with the failing phase's status.
+
+To measure tuned module expiry next to the defaults, run a second reclaim-only pass into the same `OUT`. The pass gets its own label from `MODULE_ARGS`, so the report keeps the two apart:
+
+```sh
+SKIP_LOAD=1 MODULE_ARGS='active_expire_period 100 active_expire_keys_per_loop 10000' \
+  RECLAIM_ARGS='-backends module@127.0.0.1:26380' MODULE_SO=$PWD/.cache/module-scan/tairhash_module.so \
+  scripts/bench.sh bench/results/run1
+```
 
 Re-analyse any server capture with `thbench profile RAW`, and open profiles with `go tool pprof -http=: OUT/runs/<label dir>/<run>/server.main.pprof`.
 
@@ -252,9 +262,10 @@ Each run brackets its measured window with `CONFIG RESETSTAT`, `SLOWLOG RESET` a
 |---|---|
 | `ops_per_sec`, `latency.p50/p99/p999_us` (client) | Client-observed throughput and latency, including the loopback round trip and client CPU. |
 | Report `vs module (paired)` | For each repeat, the backend's value divided by `module`'s in the same repeat, then the median of those ratios, with their spread. A cell's backends run back to back within a repeat, so pairing cancels host-load drift between repeats. A ratio of medians would keep that drift. |
-| `active_us_per_op` | Δ`used_active_time_main_thread` ÷ ops: main-thread busy time per operation, including parsing and replies. Every command runs on that thread, so this sets peak throughput and is the primary comparison metric. |
+| `busy_us_per_op` | (Δ`eventloop_duration_sum` − `harness_sec`) ÷ ops: main-thread time per operation, including parsing, replies, timers and cron. Every command runs on that thread, so this sets peak throughput and is the primary comparison metric. `eventloop_duration_sum` covers each event-loop iteration from wakeup to the next sleep. `used_active_time_main_thread` is not used because it only counts iterations that did client I/O, so module timers and cron-driven expiry, which run in idle iterations, would vanish from expiry measurements. |
+| `busy_main_sec`, `harness_sec` | Δ`eventloop_duration_sum` in seconds, and the commandstats execution time of the bench's own commands (`INFO`, `DBSIZE`, `PING`, resets, `MEMORY`, `EXHEXPIREINFO`) in the same window. Their parse and reply overhead, a few µs each, is not separable and stays in. |
 | `cpu_us_per_op` | Δ(`used_cpu_user` + `used_cpu_sys`) ÷ ops, across all threads. |
-| `utilization`, `timeline.utilization_min/max` | Main-thread busy time ÷ wall time, for the window and per second. Below ~0.9 the client or the round trip limited the run. A wide min–max range means the window was not steady. |
+| `utilization`, `timeline.utilization_min/max` | Δ`eventloop_duration_sum` ÷ wall time, for the window and per second. Below ~0.9 the client or the round trip limited the run. A wide min–max range means the window was not steady. |
 | `eventloop.us_per_op`, `cmd_us_per_op`, `noncmd_us_per_op` | `eventloop_duration_sum` and `eventloop_duration_cmd_sum` per op. This splits server time into command execution and everything else (read, parse, reply, before/after-sleep, timers). |
 | `eventloop.ops_per_cycle` | Operations per event-loop iteration: the batching factor that amortises syscalls and wakeups. |
 | `io.reads_per_op`, `io.writes_per_op`, `io.in_bytes_per_op`, `io.out_bytes_per_op` | Socket reads/writes and bytes per operation (FCALL's argument encoding shows up in `in_bytes`). |
@@ -265,7 +276,7 @@ Each run brackets its measured window with `CONFIG RESETSTAT`, `SLOWLOG RESET` a
 | `slowlog`, `latency_events` | SLOWLOG entries (≥ 1 ms) and latency-monitor events (≥ 1 ms) in the window. |
 | `server_profile.summary` (profiled pass) | Main-thread phase and component breakdown, top self/cumulative functions, and unclassified leaves. |
 | Reclaim: `bytes_per_field`, `dataset_bytes_per_field`, `memory_usage_per_field` | `used_memory` growth, `used_memory_dataset` growth and exact `MEMORY USAGE` per field. `used_memory` is the cross-backend number of record: `MEMORY USAGE` of a module key reports whatever the module's `mem_usage` callback returns. |
-| Reclaim: `server_metrics.active_us_per_op` | Main-thread cost per reclaimed field, including client-driven sweeping for `lua`. |
+| Reclaim: `server_metrics.busy_us_per_op` | Main-thread cost per reclaimed field, including module timers, core active expiry and client-driven sweeping for `lua`, net of the harness's polling. The window opens 500 ms before the deadline, so reclamation that starts the moment the deadline passes is inside it. The `lua` sweeper starts at the deadline itself. |
 
 ### Artifacts
 
@@ -273,7 +284,7 @@ Each run brackets its measured window with `CONFIG RESETSTAT`, `SLOWLOG RESET` a
 
 | File | Content |
 |---|---|
-| `info.before.txt`, `info.after.txt` | Full `INFO everything` + `INFO debug` bracketing the window (reclaim: baseline, loaded, deadline, done). |
+| `info.before.txt`, `info.after.txt` | Full `INFO everything` + `INFO debug` bracketing the window (reclaim: baseline, loaded, deadline (taken 500 ms before it), done). |
 | `config.txt` | `CONFIG GET *`. |
 | `memory-stats.txt` | `MEMORY STATS` at the end of the window. |
 | `slowlog.json`, `latency.json` | SLOWLOG entries; `LATENCY LATEST` and `LATENCY HISTORY` per event. |
@@ -297,7 +308,7 @@ macOS `sample` is wall-clock, so main-thread samples blocked in `kevent` count a
 - **`db N holds K keys; pass -flush`**: the bench database is not empty. Point `-db` at a scratch database, or pass `-flush` if erasing it is fine.
 - **`backend module: tairhash: module not loaded`**: the server at that address lacks the module. Check `MODULE LIST`, and run module benchmarks with `module@host:port`.
 - **`backend native: server lacks HSETEX`**: the server is older than Valkey 9.0.
-- **`load took Xs, past the lease`** (reclaim): loading outran the shared deadline. Raise `-lease` or shrink `-keys`/`-fields`.
+- **`load took Xs, past the lease`** or **`reclaim window opened ... after the deadline`** (reclaim): loading, `MEMORY USAGE` sampling or the window-opening snapshot outran the shared deadline. Raise `-lease`, or shrink `-keys`/`-fields`/`-memory-sample-keys`.
 - **reclaim reports `no (N keys left)` for `module`**: expected with SCAN-mode defaults, which reclaim ≤ 1000 fields per second per database. Check `server.tairhash_active_expire` in the result, then rerun with `MODULE_ARGS='active_expire_period 100 active_expire_keys_per_loop 10000'` to measure a tuned configuration.
 - **Large run-to-run spread, or throughput that falls with `load_avg_1m_start_end`**: the server's main thread is competing for CPU.
   - **Apple silicon**: an M4 has 4 performance and 6 efficiency cores. Once load exceeds the performance-core count, the scheduler can move `valkey-server` onto an efficiency core, and its cost per op rises by tens of percent. Check `host.placement` in the result: `client: taskpolicy -c utility` keeps the load generator mostly off the performance cores. Other processes still compete, so check `host-load.txt` and the per-repeat load in each result. Compare backends with the paired `vs module` ratio, not absolute numbers.
