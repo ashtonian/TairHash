@@ -320,6 +320,7 @@ func reclaimCmd(ctx context.Context, log *slog.Logger, args []string) error {
 	lease := fs.Duration("lease", 30*time.Second, "time from load start to the shared expiry deadline")
 	timeout := fs.Duration("timeout", 5*time.Minute, "give up waiting for reclamation after this")
 	poll := fs.Duration("poll", 100*time.Millisecond, "DBSIZE sampling interval")
+	idle := fs.Duration("idle-window", 3*time.Second, "idle-server measurement before loading; its busy rate is subtracted from the reclaim cost (0 disables)")
 	sweepEvery := fs.Duration("sweep-every", 100*time.Millisecond, "sweeper period for the lua backend")
 	sweepBudget := fs.Int("sweep-budget", 10_000, "fields the lua sweeper may reclaim per period")
 	memSample := fs.Int("memory-sample-keys", 200, "logical keys measured with MEMORY USAGE after loading")
@@ -338,7 +339,7 @@ func reclaimCmd(ctx context.Context, log *slog.Logger, args []string) error {
 
 	for _, t := range e.targets {
 		res, err := bench.Reclaim(ctx, t.srv, t.Backend, ks, bench.ReclaimConfig{
-			Lease: *lease, Timeout: *timeout, Poll: *poll,
+			Lease: *lease, Timeout: *timeout, Poll: *poll, IdleWindow: *idle,
 			SweepEvery: *sweepEvery, SweepBudget: *sweepBudget, MemorySampleKeys: *memSample,
 			Label: c.label, DB: c.db, ArtifactsDir: c.artifacts, Placement: c.placement,
 		})
@@ -353,7 +354,8 @@ func reclaimCmd(ctx context.Context, log *slog.Logger, args []string) error {
 			slog.Float64("reclaim_sec", res.ReclaimSec), slog.Float64("fields_per_sec", res.FieldsPerSec),
 			slog.Float64("bytes_per_field", res.BytesPerField),
 			slog.Float64("memory_usage_per_field", res.MemoryUsagePerField),
-			slog.Float64("server_busy_us_per_field", res.Server.BusyUsPerOp),
+			slog.Float64("server_busy_us_per_field", res.BusyUsPerField),
+			slog.Float64("idle_busy_per_sec", res.IdleBusyPerSec),
 			slog.Int64("server_expired_fields", res.Server.ExpiredFields),
 			slog.Int64("module_active_expired", res.Server.ModuleActiveExpired),
 			slog.Int64("remaining_keys", res.RemainingKeys))

@@ -75,6 +75,7 @@ These are the module's actual behaviours, confirmed against `src/tairhash.c`. A 
 | `-poll` | duration | `100ms` | `DBSIZE`/`used_memory` sampling interval. |
 | `-sweep-every` | duration | `100ms` | Period of the client-driven sweeper (`lua` only). |
 | `-sweep-budget` | int | `10000` | Fields the sweeper may reclaim per period. |
+| `-idle-window` | duration | `3s` | Measures the empty server's background busy rate (cron, module timers) before loading. That rate times the reclaim window is subtracted from the reclaim work, so a slow reclaimer is not charged for idle event-loop time. `0` disables the subtraction. |
 | `-memory-sample-keys` | int | `200` | Logical keys measured with exact `MEMORY USAGE` after loading. Every physical key is summed, so for `lua` that is the data hash plus its index. |
 
 ### `thbench profile`
@@ -276,6 +277,7 @@ Each run brackets its measured window with `CONFIG RESETSTAT`, `SLOWLOG RESET` a
 | `slowlog`, `latency_events` | SLOWLOG entries (≥ 1 ms) and latency-monitor events (≥ 1 ms) in the window. |
 | `server_profile.summary` (profiled pass) | Main-thread phase and component breakdown, top self/cumulative functions, and unclassified leaves. |
 | Reclaim: `bytes_per_field`, `dataset_bytes_per_field`, `memory_usage_per_field` | `used_memory` growth, `used_memory_dataset` growth and exact `MEMORY USAGE` per field. `used_memory` is the cross-backend number of record: `MEMORY USAGE` of a module key reports whatever the module's `mem_usage` callback returns. |
+| Reclaim: `idle_busy_per_sec`, `busy_us_per_field` | The empty server's background busy rate, measured over `-idle-window` before loading, and the reclaim work per field: Δ`eventloop_duration_sum` in the window minus harness commands minus `idle_busy_per_sec` × window, divided by fields reclaimed. `server_metrics.busy_us_per_op` is the same without the idle subtraction. |
 | Reclaim: `server_metrics.busy_us_per_op` | Main-thread cost per reclaimed field, including module timers, core active expiry and client-driven sweeping for `lua`, net of the harness's polling. The window opens 500 ms before the deadline, so reclamation that starts the moment the deadline passes is inside it. The `lua` sweeper starts at the deadline itself. |
 
 ### Artifacts

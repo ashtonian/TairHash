@@ -20,6 +20,11 @@ type ReclaimConfig struct {
 	Timeout time.Duration
 	// Poll is how often key count and server activity are sampled.
 	Poll time.Duration
+	// IdleWindow is how long the empty server's background busy rate (cron,
+	// module timers) is measured before loading. That rate times the reclaim
+	// window is subtracted from the reclaim cost, so a slow reclaimer is not
+	// charged for the idle event loop it waited through.
+	IdleWindow time.Duration
 	// SweepEvery and SweepBudget drive Sweeper backends: every SweepEvery the
 	// client asks the server to reclaim up to SweepBudget fields.
 	SweepEvery  time.Duration
@@ -36,6 +41,44 @@ type ReclaimConfig struct {
 // reclaimWindowLead is how long before the deadline the reclaim window opens.
 // It must exceed the time ResetDiagnostics and a full snapshot take.
 const reclaimWindowLead = 500 * time.Millisecond
+
+// reclaimWorkUsPerField is the reclaim window's busy time net of harness
+// commands and of the idle background rate, per field reclaimed.
+func reclaimWorkUsPerField(m ServerMetrics, idleBusyPerSec, reclaimed float64) float64 {
+	if reclaimed <= 0 {
+		return 0
+	}
+	return (m.BusyMainSec - m.HarnessSec - idleBusyPerSec*m.WindowSec) * 1e6 / reclaimed
+}
+
+// idleBusyRate measures the server's background busy rate with nothing to do.
+func idleBusyRate(ctx context.Context, srv *Server, window time.Duration, db int) (float64, error) {
+	if window <= 0 {
+		return 0, nil
+	}
+	if err := srv.ResetDiagnostics(ctx); err != nil {
+		return 0, err
+	}
+	start, err := srv.Snapshot(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if err := sleepUntil(ctx, time.Now().Add(window)); err != nil {
+		return 0, err
+	}
+	end, err := srv.Snapshot(ctx)
+	if err != nil {
+		return 0, err
+	}
+	m, err := Measure(start, end, 0, db)
+	if err != nil {
+		return 0, err
+	}
+	if m.WindowSec <= 0 {
+		return 0, fmt.Errorf("idle window of %s measured as %.3fs", window, m.WindowSec)
+	}
+	return (m.BusyMainSec - m.HarnessSec) / m.WindowSec, nil
+}
 
 func sleepUntil(ctx context.Context, t time.Time) error {
 	timer := time.NewTimer(time.Until(t))
@@ -89,11 +132,17 @@ type ReclaimResult struct {
 	// Server covers the window from just before the deadline until the data
 	// was gone (or the timeout), including client-driven sweeping, net of the
 	// harness's own polling; per-op figures are per field reclaimed.
-	Server      ServerMetrics   `json:"server_metrics"`
-	SweepCalls  int64           `json:"sweep_calls,omitempty"`
-	SweptFields int64           `json:"swept_fields,omitempty"`
-	Timeline    []ReclaimSample `json:"timeline"`
-	Artifacts   string          `json:"artifacts,omitempty"`
+	Server ServerMetrics `json:"server_metrics"`
+	// IdleBusyPerSec is main-thread busy seconds per second on the empty
+	// server, net of harness commands, measured over IdleWindow before loading.
+	IdleBusyPerSec float64 `json:"idle_busy_per_sec"`
+	// BusyUsPerField is the reclamation work alone: Server's busy time net of
+	// harness commands and of IdleBusyPerSec over the window, per field.
+	BusyUsPerField float64         `json:"busy_us_per_field"`
+	SweepCalls     int64           `json:"sweep_calls,omitempty"`
+	SweptFields    int64           `json:"swept_fields,omitempty"`
+	Timeline       []ReclaimSample `json:"timeline"`
+	Artifacts      string          `json:"artifacts,omitempty"`
 
 	ServerFacts Facts     `json:"server"`
 	Host        HostFacts `json:"host"`
@@ -117,6 +166,9 @@ func Reclaim(ctx context.Context, srv *Server, b Backend, ks *Keyspace, cfg Recl
 		return res, err
 	}
 	res.Host = hostFacts(cfg.Placement)
+	if res.IdleBusyPerSec, err = idleBusyRate(ctx, srv, cfg.IdleWindow, cfg.DB); err != nil {
+		return res, err
+	}
 	if err := srv.ResetDiagnostics(ctx); err != nil {
 		return res, err
 	}
@@ -282,6 +334,7 @@ func Reclaim(ctx context.Context, srv *Server, b Backend, ks *Keyspace, cfg Recl
 	if err := captureDiagnostics(ctx, srv, art, &res.Server); err != nil {
 		return res, err
 	}
+	res.BusyUsPerField = reclaimWorkUsPerField(res.Server, res.IdleBusyPerSec, reclaimed)
 	if reclaimed > 0 && res.ReclaimSec > 0 {
 		res.FieldsPerSec = reclaimed / res.ReclaimSec
 	}

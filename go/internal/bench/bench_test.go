@@ -161,3 +161,11 @@ func TestProfilerArgvKeepsSubstitutedPathWhole(t *testing.T) {
 	_, err = (&Profiler{Template: "  "}).argv(1, time.Second, "x")
 	assert.Error(t, err)
 }
+
+func TestReclaimWorkExcludesHarnessAndIdle(t *testing.T) {
+	// 20s window, 0.142s busy, 0.002s of it INFO polling, idle background 0.6%:
+	// 0.142 - 0.002 - 0.12 = 0.020s of reclaim work over 20000 fields.
+	m := ServerMetrics{WindowSec: 20, BusyMainSec: 0.142, HarnessSec: 0.002}
+	assert.InDelta(t, 1.0, reclaimWorkUsPerField(m, 0.006, 20000), 1e-9)
+	assert.Equal(t, 0.0, reclaimWorkUsPerField(m, 0.006, 0))
+}

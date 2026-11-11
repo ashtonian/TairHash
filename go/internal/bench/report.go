@@ -331,8 +331,9 @@ func writeReclaim(b *strings.Builder, reclaims []ReclaimResult) {
 		return
 	}
 	b.WriteString("\n## reclaim — every field expires at one deadline; nothing reads them afterwards\n\n")
-	b.WriteString("| label | backend | fields | used_memory B/field | dataset B/field | MEMORY USAGE B/field | load s | reclaimed | reclaim s | fields/s | busy s | busy µs/field | server expired_fields | module active/passive | sweeps | latency events |\n")
-	b.WriteString("|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---|---:|---|\n")
+	b.WriteString("Reclaim work is main-thread busy time in the window net of harness commands and of the idle server's background rate (cron, timers) over the window.\n\n")
+	b.WriteString("| label | backend | fields | used_memory B/field | dataset B/field | MEMORY USAGE B/field | load s | reclaimed | reclaim s | fields/s | idle busy % | work s | work µs/field | server expired_fields | module active/passive | sweeps | latency events |\n")
+	b.WriteString("|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---|---:|---|\n")
 	for _, r := range reclaims {
 		reclaimed := "yes"
 		if !r.Reclaimed {
@@ -346,9 +347,10 @@ func writeReclaim(b *strings.Builder, reclaims []ReclaimResult) {
 		for _, e := range r.Server.LatencyEvents {
 			events = append(events, fmt.Sprintf("%s max %dms", e.Event, e.MaxMs))
 		}
-		fmt.Fprintf(b, "| %s | %s | %d | %.0f | %.0f | %.0f | %.1f | %s | %.1f | %.0f | %.3f | %.2f | %d | %s | %d | %s |\n",
+		fmt.Fprintf(b, "| %s | %s | %d | %.0f | %.0f | %.0f | %.1f | %s | %.1f | %.0f | %.2f | %.3f | %.2f | %d | %s | %d | %s |\n",
 			r.Label, r.Backend, r.Keys*r.Fields, r.BytesPerField, r.DatasetBytesPerField, r.MemoryUsagePerField,
-			r.LoadSec, reclaimed, r.ReclaimSec, r.FieldsPerSec, r.Server.BusyMainSec-r.Server.HarnessSec, r.Server.BusyUsPerOp,
+			r.LoadSec, reclaimed, r.ReclaimSec, r.FieldsPerSec, 100*r.IdleBusyPerSec,
+			r.Server.BusyMainSec-r.Server.HarnessSec-r.IdleBusyPerSec*r.Server.WindowSec, r.BusyUsPerField,
 			r.Server.ExpiredFields, module, r.SweepCalls, strings.Join(events, ", "))
 	}
 }
