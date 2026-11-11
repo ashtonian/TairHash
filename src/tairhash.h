@@ -18,14 +18,21 @@
 #include <stdio.h>
 
 #include "dict.h"
+#include "alloc_size.h"
+#include "fieldtable.h"
 #include "list.h"
 #include "redismodule.h"
 #include "skiplist.h"
 #include "slabapi.h"
 #include "util.h"
 
+/* Reported to the server (MODULE LIST, INFO modules) as major * 10000 + minor * 100 + patch. */
+#define TAIRHASH_MODULE_VERSION 20100
+
 #define TAIRHASH_ERRORMSG_SYNTAX "ERR syntax error"
 #define TAIRHASH_ERRORMSG_VERSION "ERR update version is stale"
+#define TAIRHASH_ERRORMSG_INTERNAL_CMD "ERR only accepted from the replication stream or while loading"
+#define TAIRHASH_ERRORMSG_REPL_LAYOUT "ERR unknown EXHMSETREPL layout: upgrade this node to the master's TairHash version"
 #define TAIRHASH_ERRORMSG_NOT_INTEGER "ERR value is not an integer"
 #define TAIRHASH_ERRORMSG_NOT_FLOAT "ERR value is not an float"
 #define TAIRHASH_ERRORMSG_OVERFLOW "ERR increment or decrement would overflow"
@@ -59,31 +66,37 @@
 #define Module_Assert(_e) ((_e) ? (void)0 : (_moduleAssert(#_e, __FILE__, __LINE__), abort()))
 
 /*
- * We use `version` and `expire` as part of the tairhash value. This may be different
- * from the expire on the redis key. Redis regards `expire` as part of the database, not
- * part of the key. For example, after you perform a restore on a key, the original expire
- * will be Lost unless you specify ttl again. The `version` and `expire` of tairhash will
- * be completely recovered after the restore.
+ * Each field (see TairHashField in fieldtable.h) carries `version` and `expire` as part
+ * of the tairhash value. This may be different from the expire on the redis key. Redis
+ * regards `expire` as part of the database, not part of the key. For example, after you
+ * perform a restore on a key, the original expire will be Lost unless you specify ttl
+ * again. The `version` and `expire` of tairhash will be completely recovered after the
+ * restore.
+ *
+ * `seq` is the server-assigned write sequence of the field's last value write. It is
+ * strictly increasing per server across key lifetimes (see tairHashNextSeq), so EXHSYNC
+ * can tell a field written after a reader took its sync token apart from one the source
+ * of truth no longer has, independently of the caller-supplied `version`.
  */
-typedef struct TairHashVal {
-    long long version;
-    long long expire;
-    RedisModuleString *value;
-} TairHashVal;
 
 /*
  * `expire_index` is allocated on the first field that gets a TTL, so a hash that never
  * uses field expiration pays nothing for it. Use TAIRHASH_EXPIRE_INDEX_LEN to read its
  * length.
+ *
+ * `synced` marks the hash as an authoritative copy of an external source of truth
+ * (set by EXHSYNC). A synced hash is kept even when it has no fields, so "the source
+ * has nothing for this key" is cacheable.
  */
 typedef struct tairHashObj {
-    dict *hash;
+    fieldTable hash;
 #if defined SLAB_MODE
     tairhash_zskiplist *expire_index;
 #else
     m_zskiplist *expire_index;
 #endif
     RedisModuleString *key;
+    int synced;
 } tairHashObj;
 
 #define TAIRHASH_EXPIRE_INDEX_LEN(o) ((o)->expire_index ? (o)->expire_index->length : 0)

@@ -835,6 +835,83 @@ start_server {tags {"tairhash"} overrides {bind 0.0.0.0}} {
         }
     }
 
+    test {Field values grow and shrink in place and across reallocation, also while rehashing} {
+        r del k
+        # Enough fields that the table is rehashing while values are resized.
+        for {set i 0} {$i < 600} {incr i} {
+            r exhset k f$i [string repeat a [expr {$i % 7}]]
+            if {$i % 3 == 0} {
+                r exhset k f[expr {$i / 2}] [string repeat b [expr {($i * 37) % 300}]]
+            }
+        }
+        for {set round 0} {$round < 3} {incr round} {
+            foreach len {0 1 13 64 200 3 1000 2} {
+                r exhset k f17 [string repeat c $len]
+                assert_equal $len [r exhstrlen k f17]
+                assert_equal [string repeat c $len] [r exhget k f17]
+            }
+        }
+        assert_equal 600 [r exhlen k]
+        assert_equal 1200 [llength [r exhgetall k]]
+        set digest [r debug digest-value k]
+        r debug reload
+        assert_equal $digest [r debug digest-value k]
+    }
+
+    test {Passive expiry of fields whose names only the expire index still holds} {
+        r del k
+        r exhset k f1 v px 50
+        r exhset k f2 v px 50
+        after 100
+        # This write expires f1 and f2 first where passive expiry exists (not in slab
+        # mode), freeing the index's copies of their names.
+        r exhset k f3 v
+        assert_equal 1 [r exhlen k noexp]
+        assert_equal {} [r exhget k f1]
+    }
+
+    test {Exhscan returns every field across rehashing} {
+        r del k
+        for {set i 0} {$i < 200} {incr i} {
+            r exhset k f$i v$i
+        }
+        set seen {}
+        set cursor 0
+        set i 200
+        while 1 {
+            set reply [r exhscan k $cursor COUNT 10]
+            set cursor [lindex $reply 0]
+            foreach {f v} [lindex $reply 1] {
+                dict set seen $f $v
+            }
+            # Keep the table growing between calls.
+            r exhset k f$i v$i
+            incr i
+            if {$cursor == 0} break
+        }
+        for {set j 0} {$j < 200} {incr j} {
+            assert_equal v$j [dict get $seen f$j]
+        }
+    }
+
+    test {A large hash stays consistent under interleaved updates and deletes} {
+        r del k
+        for {set i 0} {$i < 5000} {incr i} {
+            r exhset k f$i $i
+        }
+        for {set i 0} {$i < 5000} {incr i 2} {
+            r exhdel k f$i
+        }
+        for {set i 1} {$i < 5000} {incr i 4} {
+            r exhset k f$i [string repeat x 100]
+        }
+        assert_equal 2500 [r exhlen k]
+        assert_equal 2500 [llength [r exhkeys k]]
+        assert_equal "" [r exhget k f0]
+        assert_equal 3 [r exhget k f3]
+        assert_equal [string repeat x 100] [r exhget k f1]
+    }
+
     test {Exhdelwithver} {
         r del tairhashkey
 
