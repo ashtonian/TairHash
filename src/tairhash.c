@@ -226,6 +226,83 @@ void tairHashEnsureExpireIndex(tairHashObj *o) {
 #endif
 }
 
+/* Set at load time when the server reports the REPLICATED and LOADING context flags
+ * (RedisModule_GetContextFlagsAll, Redis 6.2+). */
+static int g_can_identify_restoring = 0;
+
+/* Whether the caller may restore exact state (EXHMSETREPL): the replication stream or
+ * AOF loading carry state the master already decided, and a regular client must not be
+ * able to forge it. A server that cannot report those contexts cannot tell callers
+ * apart, so restoring stays allowed there. */
+static int mayRestoreState(RedisModuleCtx *ctx) {
+    if (!g_can_identify_restoring) {
+        return 1;
+    }
+    int flags = RedisModule_GetContextFlags(ctx);
+    return (flags & (REDISMODULE_CTX_FLAGS_REPLICATED | REDISMODULE_CTX_FLAGS_LOADING)) != 0;
+}
+
+/* Arguments per field of EXHMSETREPL: field, value, version, expire. */
+#define FIELD_STATE_ARGS 4
+
+/* Shared "0" for the expire of fields without a TTL; created at load time. */
+static RedisModuleString *g_zero_str = NULL;
+
+/* Collects the resulting state of the fields one command writes and propagates it as a
+ * single EXHMSETREPL. Propagating state rather than the request makes replicas and the
+ * AOF converge regardless of their clock (relative TTLs) and their own state (KEEPTTL,
+ * GT/VER checks, version increments); batching keeps that to one command lookup and one
+ * argv per command instead of one per field. */
+typedef struct {
+    RedisModuleCtx *ctx;
+    RedisModuleString **argv;
+    int argc;
+    int cap;
+} FieldStateBatch;
+
+static void fieldStateBatchInit(FieldStateBatch *b, RedisModuleCtx *ctx, RedisModuleString *key, int fields_hint) {
+    b->ctx = ctx;
+    b->cap = 1 + FIELD_STATE_ARGS * (fields_hint > 0 ? fields_hint : 1);
+    b->argv = RedisModule_Alloc(sizeof(RedisModuleString *) * b->cap);
+    b->argv[0] = key;
+    b->argc = 1;
+}
+
+/* Snapshots the field's state. The batch holds its own references, so a later write to
+ * the same field within the command (repeated fields) cannot invalidate it. */
+static void fieldStateBatchAdd(FieldStateBatch *b, RedisModuleString *field, const TairHashVal *val) {
+    if (b->argc + FIELD_STATE_ARGS > b->cap) {
+        b->cap *= 2;
+        b->argv = RedisModule_Realloc(b->argv, sizeof(RedisModuleString *) * b->cap);
+    }
+    b->argv[b->argc++] = takeAndRef(field);
+    b->argv[b->argc++] = takeAndRef(val->value);
+    b->argv[b->argc++] = RedisModule_CreateStringFromLongLong(NULL, val->version);
+    b->argv[b->argc++] = val->expire ? RedisModule_CreateStringFromLongLong(NULL, val->expire) : g_zero_str;
+}
+
+/* Propagates the collected state, if any, and releases the batch (argv[0], the key,
+ * belongs to the caller). */
+static void fieldStateBatchFlush(FieldStateBatch *b) {
+    if (b->argc > 1) {
+        RedisModule_Replicate(b->ctx, "EXHMSETREPL", "v", b->argv, (size_t)b->argc);
+    }
+    for (int i = 1; i < b->argc; i++) {
+        if (b->argv[i] != g_zero_str) {
+            RedisModule_FreeString(NULL, b->argv[i]);
+        }
+    }
+    RedisModule_Free(b->argv);
+    b->argv = NULL;
+}
+
+static void replicateFieldState(RedisModuleCtx *ctx, RedisModuleString *key, RedisModuleString *field, const TairHashVal *val) {
+    FieldStateBatch batch;
+    fieldStateBatchInit(&batch, ctx, key, 1);
+    fieldStateBatchAdd(&batch, field, val);
+    fieldStateBatchFlush(&batch);
+}
+
 int isReadOnlyStatus(RedisModuleCtx *ctx) {
     int flags = RedisModule_GetContextFlags(ctx);
     if (flags & REDISMODULE_CTX_FLAGS_SLAVE || flags & REDISMODULE_CTX_FLAGS_READONLY) {
@@ -908,21 +985,7 @@ int TairHashTypeHset_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv,
         RedisModule_ReplyWithLongLong(ctx, 0);
     }
 
-    size_t vlen = 0, VSIZE_MAX = 7;
-    RedisModuleString **v = RedisModule_Alloc(sizeof(RedisModuleString *) * VSIZE_MAX);
-    v[vlen++] = RedisModule_CreateStringFromString(ctx, argv[1]);
-    v[vlen++] = RedisModule_CreateStringFromString(ctx, argv[2]);
-    v[vlen++] = RedisModule_CreateStringFromString(ctx, tair_hash_val->value);
-    if (version_p) {
-        v[vlen++] = RedisModule_CreateString(ctx, "ABS", 3);
-        v[vlen++] = RedisModule_CreateStringFromLongLong(ctx, tair_hash_val->version);
-    }
-    if (expire_p) {
-        v[vlen++] = RedisModule_CreateString(ctx, "PXAT", 4);
-        v[vlen++] = RedisModule_CreateStringFromLongLong(ctx, tair_hash_val->expire);
-    }
-    RedisModule_Replicate(ctx, "EXHSET", "v", v, vlen);
-    RedisModule_Free(v);
+    replicateFieldState(ctx, argv[1], argv[2], tair_hash_val);
     return REDISMODULE_OK;
 }
 
@@ -963,10 +1026,12 @@ int TairHashTypeHsetNx_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **arg
         return REDISMODULE_OK;
     }
 
+    /* A new field starts at version 1, as with EXHSET; version 0 means "no version". */
+    tair_hash_val->version = 1;
     tair_hash_val->value = takeAndRef(svalue);
     m_dictAdd(tair_hash_obj->hash, takeAndRef(skey), tair_hash_val);
 
-    RedisModule_ReplicateVerbatim(ctx);
+    replicateFieldState(ctx, pkey, skey, tair_hash_val);
     RedisModule_ReplyWithLongLong(ctx, 1);
     return REDISMODULE_OK;
 }
@@ -999,6 +1064,8 @@ int TairHashTypeHmset_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv
     }
 
     int dbid = RedisModule_GetSelectedDb(ctx);
+    FieldStateBatch batch;
+    fieldStateBatchInit(&batch, ctx, argv[1], (argc - 2) / 2);
     for (int i = 2; i < argc; i += 2) {
         fieldExpireIfNeeded(ctx, dbid, argv[1], tair_hash_obj, argv[i], 0);
         TairHashVal *tair_hash_val = (TairHashVal *)m_dictFetchValue(tair_hash_obj->hash, argv[i]);
@@ -1007,6 +1074,7 @@ int TairHashTypeHmset_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv
             tair_hash_val = createTairHashVal();
             tair_hash_val->expire = 0;
         } else {
+            nokey = 0;
             if (tair_hash_val->value) {
                 RedisModule_FreeString(NULL, tair_hash_val->value);
             }
@@ -1016,9 +1084,10 @@ int TairHashTypeHmset_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv
         if (nokey) {
             m_dictAdd(tair_hash_obj->hash, takeAndRef(argv[i]), tair_hash_val);
         }
+        fieldStateBatchAdd(&batch, argv[i], tair_hash_val);
     }
+    fieldStateBatchFlush(&batch);
 
-    RedisModule_ReplicateVerbatim(ctx);
     RedisModule_ReplyWithSimpleString(ctx, "OK");
     return REDISMODULE_OK;
 }
@@ -1080,14 +1149,11 @@ int TairHashTypeHmsetWithOpts_RedisCommand(RedisModuleCtx *ctx, RedisModuleStrin
         }
     }
 
-    size_t vlen = 0;
-    RedisModuleString **v = RedisModule_Alloc(sizeof(RedisModuleString *) * 7);
-
+    FieldStateBatch batch;
+    fieldStateBatchInit(&batch, ctx, argv[1], (argc - 2) / 4);
     for (int i = 2; i < argc; i += 4) {
-        if (RedisModule_StringToLongLong(argv[i + 3], &when) != REDISMODULE_OK) {
-            RedisModule_ReplyWithError(ctx, TAIRHASH_ERRORMSG_SYNTAX);
-            return REDISMODULE_ERR;
-        }
+        /* Validated by the loop above. */
+        RedisModule_StringToLongLong(argv[i + 3], &when);
 
         TairHashVal *tair_hash_val = (TairHashVal *)m_dictFetchValue(tair_hash_obj->hash, argv[i]);
         if (tair_hash_val == NULL) {
@@ -1120,18 +1186,10 @@ int TairHashTypeHmsetWithOpts_RedisCommand(RedisModuleCtx *ctx, RedisModuleStrin
             m_dictAdd(tair_hash_obj->hash, takeAndRef(argv[i]), tair_hash_val);
         }
 
-        v[vlen++] = RedisModule_CreateStringFromString(ctx, argv[1]);
-        v[vlen++] = RedisModule_CreateStringFromString(ctx, argv[i]);
-        v[vlen++] = RedisModule_CreateStringFromString(ctx, argv[i + 1]);
-        v[vlen++] = RedisModule_CreateString(ctx, "ABS", 3);
-        v[vlen++] = RedisModule_CreateStringFromLongLong(ctx, tair_hash_val->version);
-        v[vlen++] = RedisModule_CreateString(ctx, "PXAT", 4);
-        v[vlen++] = RedisModule_CreateStringFromLongLong(ctx, tair_hash_val->expire);
-        RedisModule_Replicate(ctx, "EXHSET", "v", v, vlen);
-        vlen = 0;
+        fieldStateBatchAdd(&batch, argv[i], tair_hash_val);
     }
+    fieldStateBatchFlush(&batch);
 
-    RedisModule_Free(v);
     RedisModule_ReplyWithSimpleString(ctx, "OK");
     return REDISMODULE_OK;
 }
@@ -1212,6 +1270,7 @@ int TairHashTypeHpersist_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **a
         int dbid = RedisModule_GetSelectedDb(ctx);
         g_expire_algorithm.delete(ctx, dbid, argv[1], tair_hash_obj, argv[2], tair_hash_val->expire);
         tair_hash_val->expire = 0;
+        replicateFieldState(ctx, argv[1], argv[2], tair_hash_val);
         RedisModule_ReplyWithLongLong(ctx, 1);
     }
 
@@ -1322,7 +1381,7 @@ int TairHashTypeHsetVer_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **ar
 
     tair_hash_val->version = version;
     RedisModule_ReplyWithLongLong(ctx, 1);
-    RedisModule_ReplicateVerbatim(ctx);
+    replicateFieldState(ctx, argv[1], argv[2], tair_hash_val);
     return REDISMODULE_OK;
 }
 
@@ -1541,13 +1600,7 @@ int TairHashTypeHincrBy_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **ar
         m_dictAdd(tair_hash_obj->hash, takeAndRef(skey), tair_hash_val);
     }
 
-    if (milliseconds > 0) {
-        RedisModule_Replicate(ctx, "EXHSET", "sssclcl", argv[1], argv[2], tair_hash_val->value, "abs",
-                              tair_hash_val->version, "pxat", (milliseconds + RedisModule_Milliseconds()));
-    } else {
-        RedisModule_Replicate(ctx, "EXHSET", "ssscl", argv[1], argv[2], tair_hash_val->value, "abs", tair_hash_val->version);
-    }
-
+    replicateFieldState(ctx, argv[1], argv[2], tair_hash_val);
     RedisModule_ReplyWithLongLong(ctx, cur_val);
     return REDISMODULE_OK;
 }
@@ -1785,12 +1838,7 @@ int TairHashTypeHincrByFloat_RedisCommand(RedisModuleCtx *ctx, RedisModuleString
         m_dictAdd(tair_hash_obj->hash, takeAndRef(skey), tair_hash_val);
     }
 
-    if (milliseconds > 0) {
-        RedisModule_Replicate(ctx, "EXHSET", "sssclcl", argv[1], argv[2], tair_hash_val->value, "abs", tair_hash_val->version, "pxat",
-                              (milliseconds + RedisModule_Milliseconds()));
-    } else {
-        RedisModule_Replicate(ctx, "EXHSET", "ssscl", argv[1], argv[2], tair_hash_val->value, "abs", tair_hash_val->version);
-    }
+    replicateFieldState(ctx, argv[1], argv[2], tair_hash_val);
     RedisModule_ReplyWithString(ctx, tair_hash_val->value);
     return REDISMODULE_OK;
 }
@@ -2728,6 +2776,87 @@ int TairHashTypeActiveExpireInfo_RedisCommand(RedisModuleCtx *ctx, RedisModuleSt
     return REDISMODULE_OK;
 }
 
+/* Returns the tairhash at an open key, creating it when the key is empty, or NULL
+ * (after replying WRONGTYPE) when the key holds another type. */
+static tairHashObj *getOrCreateTairHash(RedisModuleCtx *ctx, RedisModuleKey *key, RedisModuleString *keyname) {
+    if (RedisModule_KeyType(key) == REDISMODULE_KEYTYPE_EMPTY) {
+        tairHashObj *o = createTairHashTypeObject();
+        o->key = RedisModule_CreateStringFromString(NULL, keyname);
+        RedisModule_ModuleTypeSetValue(key, TairHashType, o);
+        return o;
+    }
+    if (RedisModule_ModuleTypeGetType(key) != TairHashType) {
+        RedisModule_ReplyWithError(ctx, REDISMODULE_ERRORMSG_WRONGTYPE);
+        return NULL;
+    }
+    return RedisModule_ModuleTypeGetValue(key);
+}
+
+/* EXHMSETREPL <key> <field> <value> <version> <expire> [...]
+ *
+ * Internal: sets each field to exactly the given state (expire is an absolute unix time
+ * in milliseconds, 0 for none), creating the hash if needed. Emitted by every write
+ * command for replicas and the AOF, and by AOF rewrite; rejected from regular clients.
+ * Version 0 is accepted: fields written before versioning existed carry it. */
+int TairHashTypeHmsetRepl_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    RedisModule_AutoMemory(ctx);
+
+    if (argc < 2 + FIELD_STATE_ARGS || (argc - 2) % FIELD_STATE_ARGS != 0) {
+        return RedisModule_WrongArity(ctx);
+    }
+    if (!mayRestoreState(ctx)) {
+        RedisModule_ReplyWithError(ctx, TAIRHASH_ERRORMSG_INTERNAL_CMD);
+        return REDISMODULE_ERR;
+    }
+
+    long long version, expire;
+    for (int i = 2; i < argc; i += FIELD_STATE_ARGS) {
+        if (RedisModule_StringToLongLong(argv[i + 2], &version) != REDISMODULE_OK || version < 0 ||
+            RedisModule_StringToLongLong(argv[i + 3], &expire) != REDISMODULE_OK || expire < 0) {
+            RedisModule_ReplyWithError(ctx, TAIRHASH_ERRORMSG_SYNTAX);
+            return REDISMODULE_ERR;
+        }
+    }
+
+    RedisModuleKey *key = RedisModule_OpenKey(ctx, argv[1], REDISMODULE_READ | REDISMODULE_WRITE);
+    tairHashObj *o = getOrCreateTairHash(ctx, key, argv[1]);
+    if (o == NULL) {
+        return REDISMODULE_ERR;
+    }
+
+    int dbid = RedisModule_GetSelectedDb(ctx);
+    for (int i = 2; i < argc; i += FIELD_STATE_ARGS) {
+        RedisModuleString *field = argv[i];
+        RedisModule_StringToLongLong(argv[i + 2], &version);
+        RedisModule_StringToLongLong(argv[i + 3], &expire);
+
+        TairHashVal *val = m_dictFetchValue(o->hash, field);
+        int exists = val != NULL;
+        if (exists) {
+            if (val->expire) {
+                g_expire_algorithm.delete(ctx, dbid, argv[1], o, field, val->expire);
+                val->expire = 0;
+            }
+            RedisModule_FreeString(NULL, val->value);
+        } else {
+            val = createTairHashVal();
+        }
+        val->value = takeAndRef(argv[i + 1]);
+        val->version = version;
+        if (!exists) {
+            m_dictAdd(o->hash, takeAndRef(field), val);
+        }
+        if (expire) {
+            g_expire_algorithm.insert(ctx, dbid, argv[1], o, field, expire);
+            val->expire = expire;
+        }
+    }
+
+    RedisModule_ReplicateVerbatim(ctx);
+    RedisModule_ReplyWithSimpleString(ctx, "OK");
+    return REDISMODULE_OK;
+}
+
 /* ========================== "tairhashtype" type methods ======================= */
 
 void *TairHashTypeRdbLoad(RedisModuleIO *rdb, int encver) {
@@ -2787,31 +2916,51 @@ void TairHashTypeRdbSave(RedisModuleIO *rdb, void *value) {
     }
 }
 
-void TairHashTypeAofRewrite(RedisModuleIO *aof, RedisModuleString *key, void *value) {
-    tairHashObj *o = (tairHashObj *)value;
-    RedisModuleString *skey;
+/* Fields per EXHMSETREPL emitted by AOF rewrite: one command per field made the AOF
+ * large and its replay slow, an unbounded one would make a huge hash a huge command. */
+#define AOF_REWRITE_FIELDS_PER_CMD 64
 
-    m_dictIterator *di;
-    m_dictEntry *de;
-
-    // TODO: rewrite to exhmset for big tairhash
-    if (o->hash) {
-        di = m_dictGetIterator(o->hash);
-        while ((de = m_dictNext(di)) != NULL) {
-            TairHashVal *val = (TairHashVal *)dictGetVal(de);
-            skey = (RedisModuleString *)dictGetKey(de);
-            if (val->expire) {
-                if (isExpire(val->expire)) {
-                    /* For expired field, we do not REWRITE it. */
-                    continue;
-                }
-                RedisModule_EmitAOF(aof, "EXHSET", "sssclcl", key, skey, val->value, "PXAT", val->expire, "ABS", val->version);
-            } else {
-                RedisModule_EmitAOF(aof, "EXHSET", "ssscl", key, skey, val->value, "ABS", val->version);
+static void emitFieldStates(RedisModuleIO *aof, RedisModuleString **argv, int argc) {
+    RedisModule_EmitAOF(aof, "EXHMSETREPL", "v", argv, (size_t)argc);
+    /* The numeric arguments of each field are owned here; field and value are not. */
+    for (int i = 1; i < argc; i += FIELD_STATE_ARGS) {
+        for (int j = 2; j < FIELD_STATE_ARGS; j++) {
+            if (argv[i + j] != g_zero_str) {
+                RedisModule_FreeString(NULL, argv[i + j]);
             }
         }
-        m_dictReleaseIterator(di);
     }
+}
+
+void TairHashTypeAofRewrite(RedisModuleIO *aof, RedisModuleString *key, void *value) {
+    tairHashObj *o = (tairHashObj *)value;
+    RedisModuleString *argv[1 + FIELD_STATE_ARGS * AOF_REWRITE_FIELDS_PER_CMD];
+    int argc = 1;
+    /* The server passes a stack-allocated key, which the "v" format would try to retain. */
+    argv[0] = RedisModule_CreateStringFromString(NULL, key);
+
+    m_dictIterator *di = m_dictGetIterator(o->hash);
+    m_dictEntry *de;
+    while ((de = m_dictNext(di)) != NULL) {
+        TairHashVal *val = (TairHashVal *)dictGetVal(de);
+        if (isExpire(val->expire)) {
+            /* For expired field, we do not REWRITE it. */
+            continue;
+        }
+        argv[argc++] = (RedisModuleString *)dictGetKey(de);
+        argv[argc++] = val->value;
+        argv[argc++] = RedisModule_CreateStringFromLongLong(NULL, val->version);
+        argv[argc++] = val->expire ? RedisModule_CreateStringFromLongLong(NULL, val->expire) : g_zero_str;
+        if (argc == (int)(sizeof(argv) / sizeof(argv[0]))) {
+            emitFieldStates(aof, argv, argc);
+            argc = 1;
+        }
+    }
+    m_dictReleaseIterator(di);
+    if (argc > 1) {
+        emitFieldStates(aof, argv, argc);
+    }
+    RedisModule_FreeString(NULL, argv[0]);
 }
 
 void TairHashTypeFree(void *value) {
@@ -2955,20 +3104,22 @@ void TairHashTypeDigest(RedisModuleDigest *md, void *value) {
     m_dictIterator *di;
     m_dictEntry *de;
 
-    if (o->hash) {
-        di = m_dictGetIterator(o->hash);
-        while ((de = m_dictNext(di)) != NULL) {
-            TairHashVal *val = (TairHashVal *)dictGetVal(de);
-            skey = (RedisModuleString *)dictGetKey(de);
-            size_t val_len, skey_len;
-            const char *val_ptr = RedisModule_StringPtrLen(val->value, &val_len);
-            const char *skey_ptr = RedisModule_StringPtrLen(skey, &skey_len);
-            RedisModule_DigestAddStringBuffer(md, (unsigned char *)skey_ptr, skey_len);
-            RedisModule_DigestAddStringBuffer(md, (unsigned char *)val_ptr, val_len);
-            RedisModule_DigestEndSequence(md);
-        }
-        m_dictReleaseIterator(di);
+    /* Everything replication and persistence must reproduce, so DEBUG DIGEST catches a
+     * replica or a reload that diverged in version or TTL too. */
+    di = m_dictGetIterator(o->hash);
+    while ((de = m_dictNext(di)) != NULL) {
+        TairHashVal *val = (TairHashVal *)dictGetVal(de);
+        skey = (RedisModuleString *)dictGetKey(de);
+        size_t val_len, skey_len;
+        const char *val_ptr = RedisModule_StringPtrLen(val->value, &val_len);
+        const char *skey_ptr = RedisModule_StringPtrLen(skey, &skey_len);
+        RedisModule_DigestAddStringBuffer(md, (unsigned char *)skey_ptr, skey_len);
+        RedisModule_DigestAddStringBuffer(md, (unsigned char *)val_ptr, val_len);
+        RedisModule_DigestAddLongLong(md, val->version);
+        RedisModule_DigestAddLongLong(md, val->expire);
+        RedisModule_DigestEndSequence(md);
     }
+    m_dictReleaseIterator(di);
 }
 
 int Module_CreateCommands(RedisModuleCtx *ctx) {
@@ -3001,6 +3152,7 @@ int Module_CreateCommands(RedisModuleCtx *ctx) {
     CREATE_WRCMD("exhpexpire", TairHashTypeHpexpire_RedisCommand)
     CREATE_WRCMD("exhpexpireat", TairHashTypeHpexpireAt_RedisCommand)
     CREATE_WRCMD("exhpersist", TairHashTypeHpersist_RedisCommand)
+    CREATE_WRCMD("exhmsetrepl", TairHashTypeHmsetRepl_RedisCommand)
 
     /* readonly cmds */
     CREATE_ROCMD("exhget", TairHashTypeHget_RedisCommand)
@@ -3121,6 +3273,13 @@ int __attribute__((visibility("default"))) RedisModule_OnLoad(RedisModuleCtx *ct
 
     if (RedisModule_GetApi("RedisModule_MallocSizeString", (void **)&g_malloc_size_string) != REDISMODULE_OK) {
         g_malloc_size_string = NULL;
+    }
+    g_zero_str = RedisModule_CreateString(NULL, "0", 1);
+
+    int (*get_context_flags_all)(void) = NULL;
+    if (RedisModule_GetApi("RedisModule_GetContextFlagsAll", (void **)&get_context_flags_all) == REDISMODULE_OK && get_context_flags_all) {
+        int restoring_flags = REDISMODULE_CTX_FLAGS_REPLICATED | REDISMODULE_CTX_FLAGS_LOADING;
+        g_can_identify_restoring = (get_context_flags_all() & restoring_flags) == restoring_flags;
     }
 
     if (REDISMODULE_ERR == Module_CreateCommands(ctx)) {

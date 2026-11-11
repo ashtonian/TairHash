@@ -33,6 +33,7 @@
 #define TAIRHASH_ERRORMSG_INT_MIN_MAX "ERR min or max is specified, but value is not an integer"
 #define TAIRHASH_ERRORMSG_FLOAT_MIN_MAX "ERR min or max is specified, but value is not a float"
 #define TAIRHASH_ERRORMSG_MIN_MAX "ERR min value is bigger than max value"
+#define TAIRHASH_ERRORMSG_INTERNAL_CMD "ERR only accepted from the replication stream or while loading"
 
 #define TAIR_HASH_SET_NO_FLAGS 0
 #define TAIR_HASH_SET_NX (1 << 0)

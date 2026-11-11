@@ -998,3 +998,9 @@ OK
 ```
 
 <br/>
+
+## 复制与持久化
+
+写命令把本次写入的field的结果状态（而不是原始请求）合并为一条 `EXHMSETREPL key field value version expire [field value version expire ...]` 进行复制（expire为毫秒级unix时间戳，0表示不过期），因此从节点或AOF重放可以精确还原版本和过期时间，与其自身时钟无关。AOF重写输出同样的命令，每条 `EXHMSETREPL` 最多64个field。`EXHMSETREPL` 是内部命令，只接受来自复制流或加载过程的调用，普通客户端会收到 `ERR only accepted from the replication stream or while loading`（Redis 6.2之前的版本无法判断命令来源，因此总是接受）。
+
+旧版本的从节点不认识 `EXHMSETREPL`：请先升级从节点再升级主节点。

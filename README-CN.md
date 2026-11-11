@@ -155,6 +155,10 @@ tests/run.sh --server-ref 7.2 -- --baseport 25000   # 其他Redis分支，附加
 
 手动运行：将测试文件中的 `your_path` 替换为 `tairhash_module.so` 所在目录，复制到Redis源码的 `tests/unit/type/` 下，运行 `./runtest --single unit/type/<suite>`。
 
+## 升级
+
+旧版本的从节点会拒绝此版本产生的复制流（`EXHMSETREPL`），请先升级从节点再升级主节点。RDB编码不变。
+
 ## 客户端
 
 | language | GitHub |

@@ -165,6 +165,12 @@ To run a suite by hand instead: replace `your_path` in the suite with the direct
 `tairhash_module.so`, copy it to `tests/unit/type/` in a Redis source tree and run
 `./runtest --single unit/type/<suite>`.
 
+## Upgrading
+
+Older replicas reject the replication stream this version produces (`EXHMSETREPL`):
+upgrade replicas before their master. The RDB encoding is unchanged.
+
+
 ## Client
 
 | language | GitHub |

@@ -994,3 +994,17 @@ OK
 ```
 
 <br/>
+
+## Replication and persistence
+
+Write commands replicate the resulting state of the fields they wrote, as one
+`EXHMSETREPL key field value version expire [field value version expire ...]` per
+command (expire is an absolute unix time in milliseconds, 0 for none), instead of the
+request, so a replica or an AOF replay reproduces versions and TTLs exactly,
+independently of its own clock. AOF rewrite emits the same command, 64 fields per
+`EXHMSETREPL`. `EXHMSETREPL` is internal: it is accepted only from the replication stream
+or while loading, and a regular client gets `ERR only accepted from the replication
+stream or while loading` (on servers older than Redis 6.2, which cannot report where a
+command comes from, it is always accepted).
+
+An older replica does not know `EXHMSETREPL`: upgrade replicas before their master.
