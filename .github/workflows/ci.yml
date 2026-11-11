@@ -22,6 +22,7 @@ jobs:
           - {server: redis, version: '7.0', algorithm: slab, sanitizer: none, coverage: true}
           - {server: redis, version: '7.0', algorithm: scan, sanitizer: address}
           - {server: redis, version: '7.0', algorithm: sort, sanitizer: address}
+          - {server: redis, version: '7.0', algorithm: slab, sanitizer: address}
           - {server: redis, version: '7.2.17', algorithm: scan, sanitizer: none}
           - {server: redis, version: '7.4.12', algorithm: scan, sanitizer: none}
           - {server: redis, version: '8.10.3', algorithm: scan, sanitizer: none}
@@ -29,6 +30,7 @@ jobs:
           - {server: redis, version: '8.10.3', algorithm: slab, sanitizer: none}
           - {server: redis, version: '8.10.3', algorithm: scan, sanitizer: address}
           - {server: redis, version: '8.10.3', algorithm: sort, sanitizer: address}
+          - {server: redis, version: '8.10.3', algorithm: slab, sanitizer: address}
           - {server: valkey, version: '7.2.15', algorithm: scan, sanitizer: none}
           - {server: valkey, version: '8.1.11', algorithm: scan, sanitizer: none}
           - {server: valkey, version: '9.1.3', algorithm: scan, sanitizer: none}
@@ -36,6 +38,7 @@ jobs:
           - {server: valkey, version: '9.1.3', algorithm: slab, sanitizer: none}
           - {server: valkey, version: '9.1.3', algorithm: scan, sanitizer: address}
           - {server: valkey, version: '9.1.3', algorithm: sort, sanitizer: address}
+          - {server: valkey, version: '9.1.3', algorithm: slab, sanitizer: address}
           # arm64: no AVX2, so SLAB mode runs its scalar path.
           - {server: redis, version: '7.0', algorithm: slab, sanitizer: none, os: ubuntu-26.04-arm}
           - {server: valkey, version: '9.1.3', algorithm: scan, sanitizer: none, os: ubuntu-26.04-arm}
