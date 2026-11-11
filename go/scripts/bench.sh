@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Benchmarks the fieldhash backends end to end: starts a plain Valkey for the lua
-# and native backends and one otherwise identical Valkey per TairHash module
-# build, runs the load sweep (measured repeats, then one profiled pass) and the
-# reclaim scenario, then renders the report. Servers are stopped on exit.
+# Benchmarks the fieldhash backends end to end: starts a plain Valkey for the lua,
+# native and plain-hash backends and one otherwise identical Valkey per TairHash
+# module build, runs the load sweep (measured repeats, then one profiled pass),
+# the memory scenario and the reclaim scenario, then renders the report. Servers
+# are stopped on exit.
 #
 #   bench.sh OUT_DIR [extra thbench run flags...]
 #
@@ -13,7 +14,7 @@
 #                    its own server and benchmarked as backend <name> (default:
 #                    module=$MODULE_SO). Names match [a-z0-9][a-z0-9._+-]*.
 #   MODULE_ARGS      module load arguments for every build, e.g. "active_expire_period 100"
-#   PLAIN_BACKENDS   backends run on the plain server (default "lua native";
+#   PLAIN_BACKENDS   backends run on the plain server (default "lua native hash";
 #                    empty runs no plain server)
 #   LABEL            label recorded with every result (default with one module:
 #                    tairhash@<revision from source-revision next to its .so>,
@@ -24,6 +25,8 @@
 #   MODULE_PORT      first module server port; build i listens on MODULE_PORT+i (default 26380)
 #   RECLAIM_ARGS     extra thbench reclaim flags
 #   SKIP_LOAD=1      skip the load sweep (for example a reclaim-only pass with other MODULE_ARGS)
+#   SKIP_MEMORY=1    skip the memory scenario (memory per field with and without TTLs)
+#   MEMORY_ARGS      extra thbench memory flags
 #   SKIP_RECLAIM=1   skip the reclaim scenario
 #   SKIP_PROFILE=1   skip the profiled pass (client pprof + server sample/perf)
 #   CLIENT_QOS       macOS QoS clamp for the client (default utility; empty disables)
@@ -50,7 +53,7 @@ fi
 
 plain_port="${PLAIN_PORT:-26379}"
 module_port="${MODULE_PORT:-26380}"
-read -r -a plain_backends <<< "${PLAIN_BACKENDS-lua native}"
+read -r -a plain_backends <<< "${PLAIN_BACKENDS-lua native hash}"
 read -r -a modules <<< "${MODULES:-module=${MODULE_SO:-$here/.cache/modules/local-scan/tairhash_module.so}}"
 cli="$here/.cache/valkey-${VALKEY_VERSION:-9.1.3}/src/valkey-cli"
 thbench="$here/.cache/thbench"
@@ -159,6 +162,13 @@ if [[ -z "${SKIP_LOAD:-}" ]]; then
   "${client_cmd[@]+"${client_cmd[@]}"}" "$thbench" run -flush -backends "$backend_list" -out "$out/results.jsonl" \
     -artifacts-dir "$out/runs" -label "$label" -placement "$placement" "${profile_flag[@]+"${profile_flag[@]}"}" "$@" \
     2> >(tee -a "$out/run.log" >&2) || status=$?
+fi
+
+if [[ $status -eq 0 && -z "${SKIP_MEMORY:-}" ]]; then
+  # shellcheck disable=SC2086 # MEMORY_ARGS is a word list by design
+  "${client_cmd[@]+"${client_cmd[@]}"}" "$thbench" memory -flush -backends "$backend_list" -out "$out/results.jsonl" \
+    -artifacts-dir "$out/runs" -label "$label" -placement "$placement" ${MEMORY_ARGS:-} \
+    2> >(tee -a "$out/memory.log" >&2) || status=$?
 fi
 
 if [[ $status -eq 0 && -z "${SKIP_RECLAIM:-}" ]]; then

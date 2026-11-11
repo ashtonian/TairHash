@@ -122,19 +122,9 @@ type ReclaimResult struct {
 	ValueSize int    `json:"value_size"`
 	Lease     string `json:"lease"`
 
-	LoadSec float64 `json:"load_sec"`
-	// BytesPerField is used_memory growth per loaded field, including the
-	// backend's expiry index and allocator overhead.
-	BytesPerField float64 `json:"bytes_per_field"`
-	// DatasetBytesPerField is the growth of used_memory_dataset per field.
-	DatasetBytesPerField float64 `json:"dataset_bytes_per_field"`
-	// MemoryUsagePerField is MEMORY USAGE (exact) over every physical key of
-	// the sampled logical keys, per field.
-	MemoryUsagePerField    float64 `json:"memory_usage_per_field"`
-	MemoryUsageSampledKeys int     `json:"memory_usage_sampled_keys"`
-	LoadedKeys             int64   `json:"loaded_keys"`
-	// Load is the server's view of loading; per-op figures are per field written.
-	Load ServerMetrics `json:"load_server_metrics"`
+	// LoadMemory is loading the TTL'd keyspace: time, memory per field and
+	// the server's view of the writes.
+	LoadMemory
 
 	Reclaimed     bool    `json:"reclaimed"`
 	ReclaimSec    float64 `json:"reclaim_sec"`
@@ -191,42 +181,14 @@ func Reclaim(ctx context.Context, srv *Server, b Backend, ks *Keyspace, cfg Recl
 	if res.IdleBusyPerSec, err = idleBusyRate(ctx, srv, cfg.IdleWindow, cfg.DB); err != nil {
 		return res, err
 	}
-	if err := srv.ResetDiagnostics(ctx); err != nil {
-		return res, err
-	}
-	baseline, err := srv.Snapshot(ctx)
-	if err != nil {
-		return res, err
-	}
-
-	start := time.Now()
-	deadline := start.Add(cfg.Lease)
-	exp := tairhash.ExpireAt(deadline)
-	err = forEachField(ctx, ks, func(ctx context.Context, key, field string) error {
-		_, err := b.Store.Set(ctx, key, field, ks.value, exp, tairhash.Always)
-		return err
-	})
-	if err != nil {
-		return res, err
-	}
-	res.LoadSec = time.Since(start).Seconds()
-	loaded, err := srv.Snapshot(ctx)
-	if err != nil {
+	deadline := time.Now().Add(cfg.Lease)
+	if res.LoadMemory, err = loadMeasured(ctx, srv, b, ks, tairhash.ExpireAt(deadline), cfg.MemorySampleKeys, cfg.DB); err != nil {
 		return res, err
 	}
 	if time.Now().After(deadline) {
-		return res, fmt.Errorf("load took %.1fs, past the %s lease; raise the lease", res.LoadSec, cfg.Lease)
+		return res, fmt.Errorf("load took %.1fs and memory sampling the rest of the %s lease; raise the lease", res.LoadSec, cfg.Lease)
 	}
 	fields := float64(ks.Size())
-	if res.Load, err = Measure(baseline, loaded, int64(ks.Size()), cfg.DB); err != nil {
-		return res, err
-	}
-	res.LoadedKeys, _ = srv.Keys(ctx)
-	res.BytesPerField = float64(res.Load.Memory.UsedMemoryDelta) / fields
-	res.DatasetBytesPerField = float64(res.Load.Memory.DatasetDelta) / fields
-	if res.MemoryUsagePerField, res.MemoryUsageSampledKeys, err = sampleMemoryUsage(ctx, srv, b, ks, cfg.MemorySampleKeys); err != nil {
-		return res, err
-	}
 	if art.enabled() {
 		memStats, err := srv.MemoryStats(ctx)
 		if err != nil {
@@ -400,8 +362,8 @@ func Reclaim(ctx context.Context, srv *Server, b Backend, ks *Keyspace, cfg Recl
 	res.Time = time.Now().UTC()
 
 	for name, content := range map[string]string{
-		"info.baseline.txt":      baseline.Raw,
-		"info.loaded.txt":        loaded.Raw,
+		"info.baseline.txt":      res.baseline.Raw,
+		"info.loaded.txt":        res.loaded.Raw,
 		"info.deadline.txt":      atDeadline.Raw,
 		"info.done.txt":          done.Raw,
 		"module-expire.done.txt": done.ModuleExpire,

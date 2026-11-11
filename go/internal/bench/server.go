@@ -332,6 +332,15 @@ func (s *Server) MemoryUsage(ctx context.Context, key string) (int64, error) {
 	return n, nil
 }
 
+// ObjectEncoding returns OBJECT ENCODING key.
+func (s *Server) ObjectEncoding(ctx context.Context, key string) (string, error) {
+	enc, err := s.vk.Do(ctx, s.vk.B().ObjectEncoding().Key(key).Build()).ToString()
+	if err != nil {
+		return "", fmt.Errorf("OBJECT ENCODING %q: %w", key, err)
+	}
+	return enc, nil
+}
+
 // ResetDiagnostics clears commandstats, latencystats, errorstats, the slowlog
 // and latency-monitor history so the next window is measured in isolation.
 func (s *Server) ResetDiagnostics(ctx context.Context) error {

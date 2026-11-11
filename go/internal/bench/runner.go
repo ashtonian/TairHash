@@ -178,8 +178,8 @@ func RunID(backend, workload string, concurrency, repeat int, profiled bool) str
 // Run prepares wl on a flushed database, warms up, then measures one window
 // with full server-side capture.
 func Run(ctx context.Context, srv *Server, b Backend, wl Workload, ks *Keyspace, cfg RunConfig) (Result, error) {
-	if wl.NeedsVersions && b.Versioned == nil {
-		return Result{}, fmt.Errorf("workload %s needs versions, which backend %s lacks", wl.Name, b.Name)
+	if !wl.Supports(b) {
+		return Result{}, fmt.Errorf("workload %s needs versions or TTLs, which backend %s lacks", wl.Name, b.Name)
 	}
 	art, err := newArtifacts(cfg.ArtifactsDir, cfg.Label, RunID(b.Name, wl.Name, cfg.Concurrency, cfg.Repeat, cfg.Profiled))
 	if err != nil {

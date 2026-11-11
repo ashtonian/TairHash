@@ -8,7 +8,7 @@ import (
 )
 
 // BackendTypes are the implementations a backend spec may name.
-var BackendTypes = []string{"module", "lua", "native"}
+var BackendTypes = []string{"module", "lua", "native", "hash"}
 
 // BackendSpec is one -backends entry: [name=]type[@host:port].
 type BackendSpec struct {

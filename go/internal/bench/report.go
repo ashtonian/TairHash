@@ -106,9 +106,10 @@ func resolveReference(want string, backends []string) string {
 // repeats, the server's own cost and command mix, and the main-thread profile
 // breakdown from the profiled pass. Results with different labels (builds,
 // server configs) are never pooled.
-func Report(w io.Writer, loads []Result, reclaims []ReclaimResult, opts ReportOptions) error {
+func Report(w io.Writer, rs Results, opts ReportOptions) error {
 	var b strings.Builder
-	writeEnvironment(&b, loads, reclaims)
+	writeEnvironment(&b, rs)
+	loads := rs.Loads
 
 	aggs := map[cell]*aggregate{}
 	var views []*labelView
@@ -161,7 +162,8 @@ func Report(w io.Writer, loads []Result, reclaims []ReclaimResult, opts ReportOp
 			writeWorkload(&b, v, wl, aggs)
 		}
 	}
-	writeReclaim(&b, reclaims, opts)
+	writeMemory(&b, rs.Memory)
+	writeReclaim(&b, rs.Reclaims, opts)
 	_, err := io.WriteString(w, b.String())
 	return err
 }
@@ -422,6 +424,49 @@ func formatShares(shares []serverprof.Share, n int) string {
 	return strings.Join(parts, ", ")
 }
 
+// writeMemory renders memory per field with and without TTLs, against the
+// plain hash's TTL-free load of the same label when one was measured.
+func writeMemory(b *strings.Builder, results []MemoryResult) {
+	if len(results) == 0 {
+		return
+	}
+	plain := map[string]float64{}
+	for _, r := range results {
+		if r.BackendType == "hash" {
+			if _, ok := plain[r.Label]; !ok {
+				plain[r.Label] = r.NoTTL.BytesPerField
+			}
+		}
+	}
+	vsPlain := func(label string, bytes float64) string {
+		if p := plain[label]; p > 0 {
+			return fmt.Sprintf("%.2fx", bytes/p)
+		}
+		return "—"
+	}
+	b.WriteString("\n## memory — bytes per field with and without TTLs\n\n")
+	b.WriteString("used_memory growth per field, each load into an empty database. Expire overhead is the TTL'd load minus the TTL-free one; \"vs hash\" divides by the plain hash's TTL-free load of the same label. MEMORY USAGE is what the server reports for the keys (a module's mem_usage callback for module keys).\n\n")
+	b.WriteString("| label | backend | fields | encoding (no TTL / TTL) | B/field no TTL | vs hash | B/field TTL | vs hash | expire overhead B/field | MEMORY USAGE B/field (no TTL / TTL) |\n")
+	b.WriteString("|---|---|---:|---|---:|---:|---:|---:|---:|---|\n")
+	for _, r := range results {
+		enc, ttlBytes, ttlVs, overhead, usage := r.NoTTL.Encoding, "—", "—", "—", fmt.Sprintf("%.0f", r.NoTTL.MemoryUsagePerField)
+		if t := r.TTL; t != nil {
+			enc += " / " + t.Encoding
+			ttlBytes = fmt.Sprintf("%.0f", t.BytesPerField)
+			ttlVs = vsPlain(r.Label, t.BytesPerField)
+			d := t.BytesPerField - r.NoTTL.BytesPerField
+			overhead = fmt.Sprintf("%+.0f", d)
+			if r.NoTTL.BytesPerField > 0 {
+				overhead += fmt.Sprintf(" (%+.0f%%)", 100*d/r.NoTTL.BytesPerField)
+			}
+			usage += fmt.Sprintf(" / %.0f", t.MemoryUsagePerField)
+		}
+		fmt.Fprintf(b, "| %s | %s | %d | %s | %.0f | %s | %s | %s | %s | %s |\n",
+			r.Label, r.Backend, r.Keys*r.Fields, enc, r.NoTTL.BytesPerField, vsPlain(r.Label, r.NoTTL.BytesPerField),
+			ttlBytes, ttlVs, overhead, usage)
+	}
+}
+
 func writeReclaim(b *strings.Builder, reclaims []ReclaimResult, opts ReportOptions) {
 	var measured, profiled []ReclaimResult
 	for _, r := range reclaims {
@@ -488,7 +533,7 @@ func writeReclaim(b *strings.Builder, reclaims []ReclaimResult, opts ReportOptio
 	b.WriteString(strings.Join(rows, "\n") + "\n")
 }
 
-func writeEnvironment(b *strings.Builder, loads []Result, reclaims []ReclaimResult) {
+func writeEnvironment(b *strings.Builder, rs Results) {
 	type server struct {
 		facts    Facts
 		host     HostFacts
@@ -509,17 +554,20 @@ func writeEnvironment(b *strings.Builder, loads []Result, reclaims []ReclaimResu
 		}
 	}
 	var windows []Interference
-	for _, r := range loads {
+	for _, r := range rs.Loads {
 		add(r.ServerFacts, r.Host, r.Backend)
 		if !r.Profiled {
 			windows = append(windows, r.Interference)
 		}
 	}
-	for _, r := range reclaims {
+	for _, r := range rs.Reclaims {
 		add(r.ServerFacts, r.Host, r.Backend)
 		if !r.Profiled {
 			windows = append(windows, r.Interference)
 		}
+	}
+	for _, r := range rs.Memory {
+		add(r.ServerFacts, r.Host, r.Backend)
 	}
 	if len(servers) == 0 {
 		b.WriteString("No results.\n")
@@ -551,7 +599,7 @@ func writeEnvironment(b *strings.Builder, loads []Result, reclaims []ReclaimResu
 		fmt.Fprintf(b, "- placement: %s\n", h.Placement)
 	}
 	var la []float64
-	for _, r := range loads {
+	for _, r := range rs.Loads {
 		la = append(la, r.LoadAvg[0], r.LoadAvg[1])
 	}
 	if len(la) > 0 {

@@ -9,6 +9,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/ashtonian/TairHash/go/fieldhash"
 )
 
 func TestParseInfo(t *testing.T) {
@@ -100,7 +102,7 @@ func TestReportExcludesProfiledRuns(t *testing.T) {
 		{Workload: "get", Concurrency: 16, Backend: "lua", OpsPerSec: 1, Profiled: true, Server: ServerMetrics{BusyUsPerOp: 99}},
 	}
 	var out strings.Builder
-	require.NoError(t, Report(&out, loads, nil, ReportOptions{}))
+	require.NoError(t, Report(&out, Results{Loads: loads}, ReportOptions{}))
 	assert.Contains(t, out.String(), "| 16 | lua | 1 | 50 (±0%) |")
 	assert.Contains(t, out.String(), "| 16 | lua | 5.00 | 2.50x (±0%) |")
 }
@@ -128,7 +130,7 @@ func TestReportKeepsLabelsApart(t *testing.T) {
 		{Label: "build-b", Workload: "get", Concurrency: 1, Backend: "module", OpsPerSec: 300},
 	}
 	var out strings.Builder
-	require.NoError(t, Report(&out, loads, nil, ReportOptions{}))
+	require.NoError(t, Report(&out, Results{Loads: loads}, ReportOptions{}))
 	assert.Contains(t, out.String(), "\n# build-a\n")
 	assert.Contains(t, out.String(), "\n# build-b\n")
 	assert.Contains(t, out.String(), "| 1 | module | 1 | 100 (±0%) |")
@@ -227,7 +229,7 @@ func TestReportComparesNamedBuildsAgainstReference(t *testing.T) {
 		run("develop", 1, 2, 100e3, 0), run("lazy", 1, 1, 200e3, 2.5), run("lua", 1, 4, 50e3, 0),
 	}
 	var out strings.Builder
-	require.NoError(t, Report(&out, loads, nil, ReportOptions{Reference: "develop"}))
+	require.NoError(t, Report(&out, Results{Loads: loads}, ReportOptions{Reference: "develop"}))
 	text := out.String()
 	assert.Contains(t, text, "## summary — every backend against develop")
 	assert.Contains(t, text, "| develop | 2.00 |\n| lazy | 1.00 (0.50x) † |\n| lua | 4.00 (2.00x) |")
@@ -317,4 +319,89 @@ func TestReadSourceRevision(t *testing.T) {
 	rev, err = readSourceRevision(filepath.Join(dir, "absent"))
 	require.NoError(t, err)
 	assert.Equal(t, "", rev)
+}
+
+func TestWorkloadSupports(t *testing.T) {
+	versioned := Backend{Name: "module", Versioned: fakeVersioned{}}
+	unversioned := Backend{Name: "native"}
+	plain := Backend{Name: "hash", NoTTL: true}
+	tests := []struct {
+		workload string
+		backend  Backend
+		want     bool
+	}{
+		{"set-ttl", versioned, true},
+		{"set-ttl", plain, false},
+		{"set-nottl", plain, true},
+		{"getall-nottl", plain, true},
+		{"incr-ttl", plain, false},
+		{"cas", versioned, true},
+		{"cas", unversioned, false},
+		{"cas", plain, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.workload+"/"+tt.backend.Name, func(t *testing.T) {
+			wl, ok := LookupWorkload(tt.workload)
+			require.True(t, ok)
+			assert.Equal(t, tt.want, wl.Supports(tt.backend))
+		})
+	}
+}
+
+// fakeVersioned only marks a Backend as versioned; Supports never calls it.
+type fakeVersioned struct{ fieldhash.VersionedStore }
+
+func TestWorkloadNamesPairTTLVariants(t *testing.T) {
+	names := WorkloadNames()
+	for _, n := range names {
+		base, ok := strings.CutSuffix(n, "-nottl")
+		if !ok {
+			continue
+		}
+		twin := base
+		if base == "set" || base == "incr" {
+			twin = base + "-ttl"
+		}
+		assert.Contains(t, names, twin, "%s has no TTL'd counterpart", n)
+	}
+}
+
+func TestReportMemoryAgainstPlainHash(t *testing.T) {
+	rs := Results{Memory: []MemoryResult{
+		{Label: "l", Backend: "develop", BackendType: "module", Keys: 10, Fields: 10,
+			NoTTL: LoadMemory{BytesPerField: 200, Encoding: "raw"}, TTL: &LoadMemory{BytesPerField: 300, Encoding: "raw"}},
+		{Label: "l", Backend: "hash", BackendType: "hash", Keys: 10, Fields: 10,
+			NoTTL: LoadMemory{BytesPerField: 100, Encoding: "listpack"}},
+	}}
+	var out strings.Builder
+	require.NoError(t, Report(&out, rs, ReportOptions{}))
+	text := out.String()
+	assert.Contains(t, text, "| l | develop | 100 | raw / raw | 200 | 2.00x | 300 | 3.00x | +100 (+50%) |")
+	assert.Contains(t, text, "| l | hash | 100 | listpack | 100 | 1.00x | — | — | — |")
+}
+
+func TestResultsRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "results.jsonl")
+	w, err := OpenWriter(path)
+	require.NoError(t, err)
+	require.NoError(t, w.Write(Result{Kind: "load", Backend: "module"}))
+	require.NoError(t, w.Write(ReclaimResult{Kind: "reclaim", Backend: "lua", LoadMemory: LoadMemory{BytesPerField: 148}}))
+	require.NoError(t, w.Write(MemoryResult{Kind: "memory", Backend: "hash", NoTTL: LoadMemory{BytesPerField: 90}}))
+	require.NoError(t, w.Close())
+
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"bytes_per_field":148`, "reclaim keeps its load fields at the top level")
+
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	defer f.Close()
+	var rs Results
+	require.NoError(t, rs.ReadResults(f))
+	require.Len(t, rs.Loads, 1)
+	require.Len(t, rs.Reclaims, 1)
+	require.Len(t, rs.Memory, 1)
+	assert.Equal(t, 148.0, rs.Reclaims[0].BytesPerField)
+	assert.Equal(t, 90.0, rs.Memory[0].NoTTL.BytesPerField)
+	assert.Error(t, (&Results{}).ReadResults(strings.NewReader(`{"kind":"other"}`)))
 }

@@ -141,10 +141,15 @@ func (w *Writer) Write(v any) error {
 // Close closes the file.
 func (w *Writer) Close() error { return w.f.Close() }
 
-// ReadResults decodes a JSON-lines results file into load and reclaim results.
-func ReadResults(r io.Reader) ([]Result, []ReclaimResult, error) {
-	var loads []Result
-	var reclaims []ReclaimResult
+// Results is the content of one or more results files.
+type Results struct {
+	Loads    []Result
+	Reclaims []ReclaimResult
+	Memory   []MemoryResult
+}
+
+// ReadResults decodes a JSON-lines results file and appends it to rs.
+func (rs *Results) ReadResults(r io.Reader) error {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
 	for line := 1; sc.Scan(); line++ {
@@ -152,24 +157,31 @@ func ReadResults(r io.Reader) ([]Result, []ReclaimResult, error) {
 			Kind string `json:"kind"`
 		}
 		if err := json.Unmarshal(sc.Bytes(), &kind); err != nil {
-			return nil, nil, fmt.Errorf("line %d: %w", line, err)
+			return fmt.Errorf("line %d: %w", line, err)
 		}
+		var err error
 		switch kind.Kind {
 		case "load":
-			var res Result
-			if err := json.Unmarshal(sc.Bytes(), &res); err != nil {
-				return nil, nil, fmt.Errorf("line %d: %w", line, err)
-			}
-			loads = append(loads, res)
+			err = appendDecoded(sc.Bytes(), &rs.Loads)
 		case "reclaim":
-			var res ReclaimResult
-			if err := json.Unmarshal(sc.Bytes(), &res); err != nil {
-				return nil, nil, fmt.Errorf("line %d: %w", line, err)
-			}
-			reclaims = append(reclaims, res)
+			err = appendDecoded(sc.Bytes(), &rs.Reclaims)
+		case "memory":
+			err = appendDecoded(sc.Bytes(), &rs.Memory)
 		default:
-			return nil, nil, fmt.Errorf("line %d: unknown result kind %q", line, kind.Kind)
+			err = fmt.Errorf("unknown result kind %q", kind.Kind)
+		}
+		if err != nil {
+			return fmt.Errorf("line %d: %w", line, err)
 		}
 	}
-	return loads, reclaims, sc.Err()
+	return sc.Err()
+}
+
+func appendDecoded[T any](line []byte, into *[]T) error {
+	var v T
+	if err := json.Unmarshal(line, &v); err != nil {
+		return err
+	}
+	*into = append(*into, v)
+	return nil
 }

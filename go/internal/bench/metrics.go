@@ -141,7 +141,7 @@ type TimelineStats struct {
 var harnessCommands = map[string]bool{
 	"info": true, "dbsize": true, "config|resetstat": true, "config|get": true, "slowlog|reset": true,
 	"slowlog|get": true, "latency|reset": true, "latency|latest": true, "latency|history": true,
-	"module|list": true, "exhexpireinfo": true, "memory|stats": true, "memory|usage": true, "ping": true,
+	"module|list": true, "exhexpireinfo": true, "memory|stats": true, "memory|usage": true, "object|encoding": true, "ping": true,
 	"hello": true, "client|setinfo": true, "select": true, "function|load": true, "flushdb": true,
 	"command|info": true, "exhlen": true,
 }

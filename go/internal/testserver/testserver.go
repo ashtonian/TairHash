@@ -22,6 +22,7 @@ const (
 	DBLua
 	DBNative
 	DBPresence
+	DBPlainHash
 )
 
 // Client returns a client on database db, flushed, and closes it at cleanup.

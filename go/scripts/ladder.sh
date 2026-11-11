@@ -5,7 +5,8 @@
 # loaded; the benchmark runs only if every revision passes. The load sweep runs
 # as one bench.sh invocation per workload, each taking the host lock on its
 # own so other jobs can run between chunks, then one reclaim invocation; all
-# append to OUT_DIR/results.jsonl and share OUT_DIR/report.md.
+# append to OUT_DIR/results.jsonl and share OUT_DIR/report.md. The memory
+# scenario runs in the reclaim invocation.
 #
 #   ladder.sh OUT_DIR name=ref [name=ref ...]
 #
@@ -15,7 +16,8 @@
 # Environment:
 #   TAIRHASH_REPO        repository the refs resolve in (default: the checkout
 #                        this harness lives in)
-#   WORKLOADS            workloads, one chunk each (default: every workload)
+#   WORKLOADS            workloads, one chunk each (default: every workload, from
+#                        `thbench workloads`)
 #   CONCURRENCY          -concurrency of every chunk (default 16,128)
 #   PROFILE_CONCURRENCY  levels the profiled pass covers (default: the last of CONCURRENCY)
 #   REPEAT               measured repeats per cell (default 3)
@@ -23,7 +25,7 @@
 #   LABEL                label of every result (default "ladder", plus MODULE_ARGS)
 #   CONFORMANCE_PORT     port of the throwaway conformance server (default 26990)
 #   SKIP_CONFORMANCE=1   benchmark without the conformance gate
-#   SKIP_LOAD=1, SKIP_RECLAIM=1, SKIP_PROFILE=1   skip those phases
+#   SKIP_LOAD=1, SKIP_MEMORY=1, SKIP_RECLAIM=1, SKIP_PROFILE=1   skip those phases
 #   RUN_ARGS             extra thbench run flags for every chunk, e.g. "-duration 5s"
 #   RECLAIM_ARGS         reclaim flags (default "-profile")
 #   bench.sh's environment (MODULE_ARGS, PLAIN_BACKENDS, CLIENT_QOS, ...) passes through.
@@ -87,7 +89,7 @@ conformance() {
     sleep 0.1
   done
   (cd "$here" && VALKEY_ADDR="127.0.0.1:$port" GATE_LOCK_WAIT=1 gate-lock run-focused "thbench-conformance-$name" -- \
-    go test -race -count=1 -v ./tairhash ./fieldhash/module ./fieldhash/lua ./fieldhash/native ./presence) \
+    go test -race -count=1 -v ./tairhash ./fieldhash/module ./fieldhash/lua ./fieldhash/native ./presence ./internal/plainhash) \
     > "$out/conformance-$name.log" 2>&1 || status=$?
   if [[ $status -eq 0 ]] && grep -q -- '--- SKIP' "$out/conformance-$name.log"; then
     echo "$name: integration tests skipped; see $out/conformance-$name.log" >&2
@@ -123,17 +125,22 @@ export MODULES="${modules[*]}"
 export LABEL="${LABEL:-ladder${MODULE_ARGS:+ $MODULE_ARGS}}"
 export REFERENCE="${REFERENCE:-${names[0]}}"
 export GATE_LOCK_WAIT=1
-read -r -a workloads <<< "$(echo "${WORKLOADS:-set-ttl get getall incr-ttl mixed presence cas}" | tr ',' ' ')"
+if [[ -n "${WORKLOADS:-}" ]]; then
+  read -r -a workloads <<< "$(echo "$WORKLOADS" | tr ',' ' ')"
+else
+  (cd "$here" && go build -o "$here/.cache/thbench" ./cmd/thbench)
+  mapfile -t workloads < <("$here/.cache/thbench" workloads)
+fi
 if [[ -z "${SKIP_LOAD:-}" ]]; then
   for wl in "${workloads[@]}"; do
     echo "chunk $wl: $(date -u +%H:%M:%SZ)" | tee -a "$out/ladder.txt"
     # shellcheck disable=SC2086 # RUN_ARGS is a word list by design
-    SKIP_RECLAIM=1 "$here/scripts/bench.sh" "$out" -workloads "$wl" -concurrency "$concurrency" \
+    SKIP_MEMORY=1 SKIP_RECLAIM=1 "$here/scripts/bench.sh" "$out" -workloads "$wl" -concurrency "$concurrency" \
       -repeat "${REPEAT:-3}" -profile-concurrency "$profile_concurrency" ${RUN_ARGS:-}
   done
 fi
-if [[ -z "${SKIP_RECLAIM:-}" ]]; then
-  echo "chunk reclaim: $(date -u +%H:%M:%SZ)" | tee -a "$out/ladder.txt"
+if [[ -z "${SKIP_MEMORY:-}" || -z "${SKIP_RECLAIM:-}" ]]; then
+  echo "chunk memory+reclaim: $(date -u +%H:%M:%SZ)" | tee -a "$out/ladder.txt"
   SKIP_LOAD=1 RECLAIM_ARGS="${RECLAIM_ARGS--profile}" "$here/scripts/bench.sh" "$out"
 fi
 echo "done: $(date -u +%H:%M:%SZ)" | tee -a "$out/ladder.txt"

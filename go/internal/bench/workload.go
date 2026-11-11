@@ -21,13 +21,15 @@ type Backend struct {
 	// within a run and path-safe. Several backends may share a Type, such as
 	// module builds of different revisions.
 	Name string
-	// Type is the implementation: module, lua or native.
+	// Type is the implementation: module, lua, native or hash.
 	Type  string
 	Store fieldhash.Store
 	// Versioned is nil when the backend has no per-field versions.
 	Versioned fieldhash.VersionedStore
 	// Sweeper is nil when the server reclaims expired fields itself.
 	Sweeper fieldhash.Sweeper
+	// NoTTL marks a backend that cannot store TTLs: the plain-hash baseline.
+	NoTTL bool
 	// PhysicalKeys maps a logical key to the server keys that store it; nil
 	// means the logical key is the only one.
 	PhysicalKeys func(key string) []string
@@ -98,36 +100,54 @@ type Workload struct {
 	Description string
 	// NeedsVersions restricts the workload to backends with Versioned.
 	NeedsVersions bool
+	// NeedsTTL restricts the workload to backends that store TTLs: it writes
+	// fields with one.
+	NeedsTTL bool
 	// Prepare builds per-run state and writes the data the workload reads. It
 	// returns the operation to measure.
 	Prepare func(ctx context.Context, b Backend, ks *Keyspace) (Op, error)
 }
 
+// Supports reports whether b can run the workload.
+func (wl Workload) Supports(b Backend) bool {
+	return (!wl.NeedsVersions || b.Versioned != nil) && (!wl.NeedsTTL || !b.NoTTL)
+}
+
 // Op performs one logical operation.
 type Op func(ctx context.Context, w *Worker) error
 
-// Workloads is every registered workload, in report order.
-var Workloads = []Workload{
-	{
-		Name:        "set-ttl",
-		Description: "overwrite an existing field and renew its TTL (EXHSET k f v PX ttl)",
+// expiry is what a workload's writes carry: the keyspace's lease, or no TTL
+// for the -nottl variants, which measure each backend without expiry
+// bookkeeping against the plain hash.
+func expiry(ks *Keyspace, ttl bool) tairhash.Expiry {
+	if ttl {
+		return tairhash.TTL(ks.TTL)
+	}
+	return tairhash.NoExpiry()
+}
+
+func setWorkload(name, desc string, ttl bool) Workload {
+	return Workload{
+		Name: name, Description: desc, NeedsTTL: ttl,
 		Prepare: func(ctx context.Context, b Backend, ks *Keyspace) (Op, error) {
-			if err := preload(ctx, b, ks); err != nil {
+			exp := expiry(ks, ttl)
+			if err := preload(ctx, b, ks, exp); err != nil {
 				return nil, err
 			}
-			exp := tairhash.TTL(ks.TTL)
 			return func(ctx context.Context, w *Worker) error {
 				key, field := w.pick(ks)
 				_, err := b.Store.Set(ctx, key, field, ks.value, exp, tairhash.Always)
 				return err
 			}, nil
 		},
-	},
-	{
-		Name:        "get",
-		Description: "read one live field that has a TTL (EXHGET)",
+	}
+}
+
+func getWorkload(name, desc string, ttl bool) Workload {
+	return Workload{
+		Name: name, Description: desc, NeedsTTL: ttl,
 		Prepare: func(ctx context.Context, b Backend, ks *Keyspace) (Op, error) {
-			if err := preload(ctx, b, ks); err != nil {
+			if err := preload(ctx, b, ks, expiry(ks, ttl)); err != nil {
 				return nil, err
 			}
 			return func(ctx context.Context, w *Worker) error {
@@ -139,12 +159,14 @@ var Workloads = []Workload{
 				return err
 			}, nil
 		},
-	},
-	{
-		Name:        "getall",
-		Description: "read every field of one hash (EXHGETALL)",
+	}
+}
+
+func getAllWorkload(name, desc string, ttl bool) Workload {
+	return Workload{
+		Name: name, Description: desc, NeedsTTL: ttl,
 		Prepare: func(ctx context.Context, b Backend, ks *Keyspace) (Op, error) {
-			if err := preload(ctx, b, ks); err != nil {
+			if err := preload(ctx, b, ks, expiry(ks, ttl)); err != nil {
 				return nil, err
 			}
 			return func(ctx context.Context, w *Worker) error {
@@ -156,12 +178,14 @@ var Workloads = []Workload{
 				return err
 			}, nil
 		},
-	},
-	{
-		Name:        "incr-ttl",
-		Description: "increment a counter and renew its TTL (EXHINCRBY k f 1 PX ttl)",
+	}
+}
+
+func incrWorkload(name, desc string, ttl bool) Workload {
+	return Workload{
+		Name: name, Description: desc, NeedsTTL: ttl,
 		Prepare: func(ctx context.Context, b Backend, ks *Keyspace) (Op, error) {
-			exp := tairhash.TTL(ks.TTL)
+			exp := expiry(ks, ttl)
 			err := forEachField(ctx, ks, func(ctx context.Context, key, field string) error {
 				_, err := b.Store.Set(ctx, key, field, "0", exp, tairhash.Always)
 				return err
@@ -175,15 +199,30 @@ var Workloads = []Workload{
 				return err
 			}, nil
 		},
-	},
+	}
+}
+
+// Workloads is every registered workload, in report order. Each -nottl
+// variant repeats its TTL'd counterpart with fields that never expire, which
+// is the comparison with a plain hash: the difference is the cost of expiry.
+var Workloads = []Workload{
+	setWorkload("set-ttl", "overwrite an existing field and renew its TTL (EXHSET k f v PX ttl)", true),
+	setWorkload("set-nottl", "overwrite an existing field that has no TTL (EXHSET k f v; HSET for the plain hash)", false),
+	getWorkload("get", "read one live field that has a TTL (EXHGET)", true),
+	getWorkload("get-nottl", "read one field that has no TTL (EXHGET; HGET)", false),
+	getAllWorkload("getall", "read every field of one hash (EXHGETALL)", true),
+	getAllWorkload("getall-nottl", "read every field of one hash whose fields have no TTL (EXHGETALL; HGETALL)", false),
+	incrWorkload("incr-ttl", "increment a counter and renew its TTL (EXHINCRBY k f 1 PX ttl)", true),
+	incrWorkload("incr-nottl", "increment a counter that has no TTL (EXHINCRBY k f 1; HINCRBY)", false),
 	{
 		Name:        "mixed",
 		Description: "80% get / 20% set-ttl",
+		NeedsTTL:    true,
 		Prepare: func(ctx context.Context, b Backend, ks *Keyspace) (Op, error) {
-			if err := preload(ctx, b, ks); err != nil {
+			exp := expiry(ks, true)
+			if err := preload(ctx, b, ks, exp); err != nil {
 				return nil, err
 			}
-			exp := tairhash.TTL(ks.TTL)
 			return func(ctx context.Context, w *Worker) error {
 				key, field := w.pick(ks)
 				if w.rng.IntN(10) < 2 {
@@ -198,6 +237,7 @@ var Workloads = []Workload{
 	{
 		Name:        "presence",
 		Description: "presence registry: 90% heartbeat, 9% list a user's devices, 1% disconnect",
+		NeedsTTL:    true,
 		Prepare: func(ctx context.Context, b Backend, ks *Keyspace) (Op, error) {
 			reg, err := presence.New(b.Store, presence.WithTTL(ks.TTL), presence.WithKeyPrefix(""))
 			if err != nil {
@@ -231,11 +271,12 @@ var Workloads = []Workload{
 		Name:          "cas",
 		Description:   "optimistic update: read value+version, write back with VER, retry on conflict",
 		NeedsVersions: true,
+		NeedsTTL:      true,
 		Prepare: func(ctx context.Context, b Backend, ks *Keyspace) (Op, error) {
-			if err := preload(ctx, b, ks); err != nil {
+			exp := expiry(ks, true)
+			if err := preload(ctx, b, ks, exp); err != nil {
 				return nil, err
 			}
-			exp := tairhash.TTL(ks.TTL)
 			return func(ctx context.Context, w *Worker) error {
 				key, field := w.pick(ks)
 				for attempt := 0; attempt < maxCASAttempts; attempt++ {
@@ -265,6 +306,15 @@ const maxCASAttempts = 100
 
 var errMissing = errors.New("bench: preloaded data missing")
 
+// WorkloadNames lists every workload's name in report order.
+func WorkloadNames() []string {
+	names := make([]string, len(Workloads))
+	for i, w := range Workloads {
+		names[i] = w.Name
+	}
+	return names
+}
+
 // LookupWorkload returns the named workload.
 func LookupWorkload(name string) (Workload, bool) {
 	for _, w := range Workloads {
@@ -275,8 +325,7 @@ func LookupWorkload(name string) (Workload, bool) {
 	return Workload{}, false
 }
 
-func preload(ctx context.Context, b Backend, ks *Keyspace) error {
-	exp := tairhash.TTL(ks.TTL)
+func preload(ctx context.Context, b Backend, ks *Keyspace, exp tairhash.Expiry) error {
 	return forEachField(ctx, ks, func(ctx context.Context, key, field string) error {
 		_, err := b.Store.Set(ctx, key, field, ks.value, exp, tairhash.Always)
 		return err

@@ -4,6 +4,8 @@
 //
 //	thbench run    [flags]   measure workloads, append JSON lines to -out
 //	thbench reclaim [flags]  measure expiry reclamation and memory per field
+//	thbench memory [flags]   measure memory per field with and without TTLs
+//	thbench workloads        list every workload, in report order
 //	thbench report [-reference NAME] FILE...   render results as Markdown
 //	thbench profile [flags] RAW  convert a raw server capture to pprof and a phase summary
 package main
@@ -29,6 +31,7 @@ import (
 	"github.com/ashtonian/TairHash/go/fieldhash/module"
 	"github.com/ashtonian/TairHash/go/fieldhash/native"
 	"github.com/ashtonian/TairHash/go/internal/bench"
+	"github.com/ashtonian/TairHash/go/internal/plainhash"
 	"github.com/ashtonian/TairHash/go/internal/serverprof"
 	"github.com/ashtonian/TairHash/go/tairhash"
 )
@@ -48,6 +51,12 @@ func main() {
 		err = runCmd(ctx, log, os.Args[2:])
 	case "reclaim":
 		err = reclaimCmd(ctx, log, os.Args[2:])
+	case "memory":
+		err = memoryCmd(ctx, log, os.Args[2:])
+	case "workloads":
+		for _, wl := range bench.Workloads {
+			fmt.Println(wl.Name)
+		}
 	case "report":
 		err = reportCmd(os.Args[2:])
 	case "profile":
@@ -63,10 +72,10 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: thbench run|reclaim [flags] | thbench report [-reference NAME] FILE... | thbench profile [flags] RAW")
+	fmt.Fprintln(os.Stderr, "usage: thbench run|reclaim|memory [flags] | thbench workloads | thbench report [-reference NAME] FILE... | thbench profile [flags] RAW")
 }
 
-// common holds the flags shared by run and reclaim.
+// common holds the flags shared by run, reclaim and memory.
 type common struct {
 	addr         string
 	db           int
@@ -87,8 +96,8 @@ func (c *common) register(fs *flag.FlagSet) {
 	fs.StringVar(&c.addr, "addr", "127.0.0.1:6379", "Valkey address for backends given without @addr")
 	fs.IntVar(&c.db, "db", 9, "database the bench owns; it is flushed before every run")
 	fs.BoolVar(&c.flush, "flush", false, "allow flushing -db when it already holds keys")
-	fs.StringVar(&c.backends, "backends", "module,lua,native",
-		"comma-separated [name=]type[@host:port]; types: module, lua, native; name defaults to the type and must be "+
+	fs.StringVar(&c.backends, "backends", "module,lua,native,hash",
+		"comma-separated [name=]type[@host:port]; types: module, lua, native, hash (the plain-hash baseline: no TTLs, no versions); name defaults to the type and must be "+
 			"unique, so builds of one type are told apart by name. Give each module its own server so its "+
 			"active-expire timer does not run against the other backends' data")
 	fs.IntVar(&c.keys, "keys", 10_000, "number of hashes")
@@ -208,6 +217,8 @@ func newBackend(ctx context.Context, vk valkey.Client, spec bench.BackendSpec) (
 			return bench.Backend{}, fmt.Errorf("backend %s: server lacks HSETEX (needs Valkey >= 9.0): %v", spec.Name, err)
 		}
 		b.Store = native.New(vk)
+	case "hash":
+		b.Store, b.NoTTL = plainhash.New(vk), true
 	default:
 		return bench.Backend{}, fmt.Errorf("backend %s: unknown type %q", spec.Name, spec.Type)
 	}
@@ -218,7 +229,7 @@ func runCmd(ctx context.Context, log *slog.Logger, args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	var c common
 	c.register(fs)
-	workloads := fs.String("workloads", "set-ttl,get,getall,incr-ttl,mixed,presence,cas", "comma-separated workloads")
+	workloads := fs.String("workloads", strings.Join(bench.WorkloadNames(), ","), "comma-separated workloads")
 	concurrency := fs.String("concurrency", "1,16,128", "comma-separated client concurrency levels")
 	duration := fs.Duration("duration", 10*time.Second, "measured window per run")
 	warmup := fs.Duration("warmup", 3*time.Second, "unmeasured warmup per run")
@@ -295,7 +306,7 @@ func runCmd(ctx context.Context, log *slog.Logger, args []string) error {
 					continue
 				}
 				for _, t := range e.targets {
-					if wl.NeedsVersions && t.Versioned == nil {
+					if !wl.Supports(t.Backend) {
 						continue
 					}
 					cfg := bench.RunConfig{
@@ -424,6 +435,51 @@ func reclaimOne(ctx context.Context, log *slog.Logger, e *env, t target, ks *ben
 	return nil
 }
 
+func memoryCmd(ctx context.Context, log *slog.Logger, args []string) error {
+	fs := flag.NewFlagSet("memory", flag.ExitOnError)
+	var c common
+	c.register(fs)
+	ttl := fs.Duration("ttl", time.Hour, "lease of the TTL'd load; it must outlast the measurement")
+	memSample := fs.Int("memory-sample-keys", 200, "logical keys measured with MEMORY USAGE after each load")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	ks, err := bench.NewKeyspace("memory:", c.keys, c.fields, c.valueSize, *ttl)
+	if err != nil {
+		return err
+	}
+	e, err := setup(ctx, log, c)
+	if err != nil {
+		return err
+	}
+	defer e.close()
+
+	for _, t := range e.targets {
+		res, err := bench.Memory(ctx, t.srv, t.Backend, ks, bench.MemoryConfig{
+			TTL: *ttl, MemorySampleKeys: *memSample,
+			Label: c.label, DB: c.db, ArtifactsDir: c.artifacts, Placement: c.placement,
+		})
+		if err != nil {
+			return fmt.Errorf("memory %s: %w", t.Name, err)
+		}
+		if err := e.results.Write(res); err != nil {
+			return err
+		}
+		attrs := []any{
+			slog.String("backend", t.Name), slog.String("encoding_nottl", res.NoTTL.Encoding),
+			slog.Float64("bytes_per_field_nottl", res.NoTTL.BytesPerField),
+			slog.Float64("memory_usage_per_field_nottl", res.NoTTL.MemoryUsagePerField),
+		}
+		if res.TTL != nil {
+			attrs = append(attrs, slog.String("encoding_ttl", res.TTL.Encoding),
+				slog.Float64("bytes_per_field_ttl", res.TTL.BytesPerField),
+				slog.Float64("memory_usage_per_field_ttl", res.TTL.MemoryUsagePerField))
+		}
+		log.Info("memory complete", attrs...)
+	}
+	return nil
+}
+
 func reportCmd(args []string) error {
 	fs := flag.NewFlagSet("report", flag.ExitOnError)
 	reference := fs.String("reference", "", "backend every other is compared against (default: module when present, else the first backend of each label)")
@@ -434,21 +490,19 @@ func reportCmd(args []string) error {
 	if len(files) == 0 {
 		return errors.New("report needs at least one results file")
 	}
-	var loads []bench.Result
-	var reclaims []bench.ReclaimResult
+	var rs bench.Results
 	for _, path := range files {
 		f, err := os.Open(path)
 		if err != nil {
 			return fmt.Errorf("open %s: %w", path, err)
 		}
-		l, r, err := bench.ReadResults(f)
+		err = rs.ReadResults(f)
 		f.Close()
 		if err != nil {
 			return fmt.Errorf("read %s: %w", path, err)
 		}
-		loads, reclaims = append(loads, l...), append(reclaims, r...)
 	}
-	return bench.Report(os.Stdout, loads, reclaims, bench.ReportOptions{Reference: *reference})
+	return bench.Report(os.Stdout, rs, bench.ReportOptions{Reference: *reference})
 }
 
 func profileCmd(ctx context.Context, args []string) error {

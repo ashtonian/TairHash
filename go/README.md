@@ -9,7 +9,8 @@ This module holds four related pieces:
 | `tairhash` | Typed Go driver for every TairHash module command, built on [valkey-go](https://github.com/valkey-io/valkey-go). |
 | `fieldhash` | The backend-neutral contract for "a hash whose fields expire independently", with three implementations: `module` (the TairHash module via the driver), `lua` (TairHash semantics in a Valkey Functions library on core types) and `native` (Valkey 9 hash-field expiration). |
 | `presence` | The example use case: device presence, with one hash per user and one TTL'd field per device. It runs on any `fieldhash.Store`. |
-| `cmd/thbench` | Benchmark harness that runs identical workloads against each backend, including several builds of the module side by side. It records client latency and, from the Valkey side, full INFO deltas, server-side per-command latency percentiles, the event-loop split, the slowlog and latency-monitor events, a per-second timeline, other processes' CPU in each window, and stack profiles of the server converted to pprof. It also measures expiry reclamation and memory per field, and profiles the server while it reclaims. |
+| `internal/plainhash` | The benchmark's plain-hash baseline (`hash` backend): core `HSET`/`HGET`/`HGETALL`/`HDEL`/`HINCRBY`, no TTLs, no versions. It is the "plain hash" every backend is compared with on the `-nottl` workloads and in the memory scenario. It rejects writes with a TTL and is not a `fieldhash` backend. |
+| `cmd/thbench` | Benchmark harness that runs identical workloads against each backend, including several builds of the module side by side and a plain hash as baseline. It records client latency and, from the Valkey side, full INFO deltas, server-side per-command latency percentiles, the event-loop split, the slowlog and latency-monitor events, a per-second timeline, other processes' CPU in each window, and stack profiles of the server converted to pprof. It also measures memory per field with and without TTLs, expiry reclamation, and profiles the server while it reclaims. |
 | `internal/serverprof` | Converts macOS `sample` reports and Linux `perf script` output of `valkey-server` into pprof (main thread and all threads), folded stacks and a phase/component breakdown of the main thread. |
 
 `internal/conformance` is the behavioural contract. The suite is validated against the module first, then run unchanged against `lua` and `native`. That is what makes the benchmark compare like with like: each backend has already been shown to give the same answers.
@@ -32,12 +33,12 @@ These are the module's actual behaviours, confirmed against `src/tairhash.c`. A 
 
 ## Config
 
-### `thbench run` / `thbench reclaim` (shared flags)
+### `thbench run` / `thbench reclaim` / `thbench memory` (shared flags)
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `-addr` | string | `127.0.0.1:6379` | Server used by backends listed without `@addr`. |
-| `-backends` | list | `module,lua,native` | `[name=]type[@host:port]`, where type is `module`, `lua` or `native`. The name defaults to the type, must be unique and must match `[a-z0-9][a-z0-9._+-]*`; it is what results, the report and artifact paths call the backend, so builds of one type are told apart by name (`develop=module@127.0.0.1:26380,lazy=module@127.0.0.1:26381`). Give each module its own server: its active-expire timer SCANs every database once a second and would otherwise run against the other backends' data. |
+| `-backends` | list | `module,lua,native,hash` | `[name=]type[@host:port]`, where type is `module`, `lua`, `native` or `hash` (plain-hash baseline). The name defaults to the type, must be unique and must match `[a-z0-9][a-z0-9._+-]*`; it is what results, the report and artifact paths call the backend, so builds of one type are told apart by name (`develop=module@127.0.0.1:26380,lazy=module@127.0.0.1:26381`). Give each module its own server: its active-expire timer SCANs every database once a second and would otherwise run against the other backends' data. |
 | `-db` | int | `9` | Database the bench owns. It is **flushed** before and after every run, so idle servers hold no data for module timers to scan while other backends run. |
 | `-flush` | bool | `false` | Allow flushing `-db` when it already holds keys. Without it the bench refuses to start on a non-empty database. |
 | `-keys` | int | `10000` | Number of hashes. |
@@ -54,7 +55,7 @@ These are the module's actual behaviours, confirmed against `src/tairhash.c`. A 
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
-| `-workloads` | list | `set-ttl,get,getall,incr-ttl,mixed,presence,cas` | See [Workloads](#workloads). `cas` runs only on backends with versions. |
+| `-workloads` | list | every workload (`thbench workloads`) | See [Workloads](#workloads). A workload runs only on backends that can serve it: `cas` needs versions, TTL'd workloads skip `hash`. |
 | `-concurrency` | list | `1,16,128` | Client goroutines per run. |
 | `-duration` | duration | `10s` | Measured window. |
 | `-warmup` | duration | `3s` | Unmeasured warmup. |
@@ -87,6 +88,19 @@ These are the module's actual behaviours, confirmed against `src/tairhash.c`. A 
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `-reference` | string | `""` | Backend every other is compared against, in the summary, the paired-ratio columns and the reclaim B/field ratio. Empty, or not present in a label, picks `module` when the label has it, else the label's first backend. |
+
+### `thbench memory`
+
+Loads the keyspace into each backend's empty database twice, without TTLs and (except `hash`) with them, and records memory per field for each load.
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `-ttl` | duration | `1h` | Lease of the TTL'd load. It must outlast the measurement so nothing expires while it is counted. |
+| `-memory-sample-keys` | int | `200` | Logical keys measured with exact `MEMORY USAGE` after each load. |
+
+### `thbench workloads`
+
+Prints every workload name, one per line, in report order. `scripts/ladder.sh` uses it for its default `WORKLOADS`.
 
 ### `thbench profile`
 
@@ -122,7 +136,7 @@ These are the module's actual behaviours, confirmed against `src/tairhash.c`. A 
 
 | Name | Default | Used by | Description |
 |---|---|---|---|
-| `VALKEY_ADDR` | unset | tests | Integration tests skip unless set. Each test package owns one database (10–14, see `internal/testserver`) and flushes it. |
+| `VALKEY_ADDR` | unset | tests | Integration tests skip unless set. Each test package owns one database (10–15, see `internal/testserver`) and flushes it. |
 | `VALKEY_VERSION` | `9.1.3` | make, scripts | Pinned Valkey tag built into `.cache/`. |
 | `VALKEY_MALLOC` | `jemalloc` | make | Allocator Valkey is built with, on every platform. Valkey's own default is libc malloc on macOS, where every allocation and free also pays a `malloc_size` lookup. That falls hardest on the module and Lua, whose operations allocate the most. Production Valkey runs jemalloc. Changing it triggers a full rebuild. `server.mem_allocator` in each result records which one ran. |
 | `VALKEY_SERVER` | `.cache/valkey-$VALKEY_VERSION/src/valkey-server` | `scripts/valkey-server.sh` | Server binary override. |
@@ -132,7 +146,7 @@ These are the module's actual behaviours, confirmed against `src/tairhash.c`. A 
 | `MODULE_JOBS` | `4` | make | Parallel compile jobs for `make module`. |
 | `MODULE_SO` | `.cache/modules/local-scan/tairhash_module.so` | `scripts/bench.sh` | Module to load when `MODULES` is unset. |
 | `MODULES` | `module=$MODULE_SO` | `scripts/bench.sh` | Space-separated `name=path.so` builds. Each gets its own server, on `MODULE_PORT`+i, and is benchmarked as backend `name`. |
-| `PLAIN_BACKENDS` | `lua native` | `scripts/bench.sh` | Backends run on the plain server. Empty runs no plain server. |
+| `PLAIN_BACKENDS` | `lua native hash` | `scripts/bench.sh` | Backends run on the plain server. Empty runs no plain server. |
 | `MODULE_ARGS` | `""` | `scripts/bench.sh` | Module load args for every build, for example `active_expire_period 100 active_expire_keys_per_loop 10000`. |
 | `LABEL` | one module: `tairhash@<rev>[+dirty]`; several: `modules <names>`; `ladder.sh`: `ladder`; each plus ` MODULE_ARGS` | `scripts/bench.sh`, `scripts/ladder.sh` | Label passed to both `run` and `reclaim`. `<rev>` is the first 7 characters of the commit in `source-revision` next to the module, with `+dirty` when that file lists uncommitted changes. |
 | `REFERENCE` | `bench.sh`: unset (module, else the first backend); `ladder.sh`: the first name | `scripts/bench.sh`, `scripts/ladder.sh` | `thbench report -reference`. |
@@ -141,10 +155,12 @@ These are the module's actual behaviours, confirmed against `src/tairhash.c`. A 
 | `PLAIN_PORT` / `MODULE_PORT` | `26379` / `26380` | `scripts/bench.sh` | Port of the plain server, and of the first module server; build i listens on `MODULE_PORT`+i. |
 | `RECLAIM_ARGS` | `""` | `scripts/bench.sh` | Extra `thbench reclaim` flags. |
 | `SKIP_LOAD` | unset | `scripts/bench.sh` | Set to skip the load sweep, for a reclaim-only pass into an existing `OUT` (see [Build / Run / Test](#build--run--test)). |
+| `SKIP_MEMORY` | unset | `scripts/bench.sh`, `scripts/ladder.sh` | Set to skip the memory scenario. |
+| `MEMORY_ARGS` | `""` | `scripts/bench.sh` | Extra `thbench memory` flags. |
 | `SKIP_RECLAIM` | unset | `scripts/bench.sh` | Set to skip the reclaim scenario. |
 | `SKIP_PROFILE` | unset | `scripts/bench.sh` | Set to skip the profiled pass. |
 | `TAIRHASH_REPO` | the checkout this module lives in | `scripts/ladder.sh` | Repository the ladder's refs resolve in. Each revision is cloned from it with `--shared` into `.cache/src/<name>-<commit>`. |
-| `WORKLOADS` | every workload | `scripts/ladder.sh` | Workloads, comma- or space-separated; each is one `bench.sh` chunk with its own lock hold. |
+| `WORKLOADS` | every workload (`thbench workloads`) | `scripts/ladder.sh` | Workloads, comma- or space-separated; each is one `bench.sh` chunk with its own lock hold. |
 | `CONCURRENCY` | `16,128` | `scripts/ladder.sh` | `-concurrency` of every chunk. |
 | `PROFILE_CONCURRENCY` | last of `CONCURRENCY` | `scripts/ladder.sh` | `-profile-concurrency` of every chunk. |
 | `REPEAT` | `3` | `scripts/ladder.sh` | `-repeat` of every chunk. |
@@ -222,6 +238,7 @@ type Sweeper interface { Sweep(ctx, maxFields int) (int64, error) }           //
 | `module` | `EXH*` | yes | Module timer (SCAN mode: every 1s, ≤ 1000 fields per loop by default) plus passive expiry on writes. |
 | `lua` | `FCALL fh_*` (library `fieldhash`, `fieldhash/lua/fieldhash.lua`) | yes, exact to 2⁵³ | Passive expiry on writes plus `Sweep`, which SCANs for expiry indexes. Run it periodically. |
 | `native` | `HSETEX`, `HGET`, `HGETALL`, `HDEL`, `HINCRBY`+`HPEXPIRE` in `MULTI`, `HPTTL` | no | Valkey's active expire cycle. |
+| `hash` (baseline, `internal/plainhash`) | `HSET`, `HSETNX`, `HGET`, `HGETALL`, `HDEL`, `HINCRBY` | no | Nothing expires: writes with a TTL fail with `plainhash.ErrUnsupported`. Runs only the `-nottl` workloads and the TTL-free half of the memory scenario. |
 
 Lua storage layout: logical key `K` is stored as two keys under one hash tag, so each call stays in one cluster slot:
 
@@ -235,13 +252,20 @@ The client reloads the library automatically if the server loses it (`FUNCTION F
 | Name | Operation |
 |---|---|
 | `set-ttl` | Overwrite an existing field and renew its TTL. |
+| `set-nottl` | Overwrite an existing field that has no TTL (`EXHSET k f v`; `HSETEX` without a TTL; `HSET`). |
 | `get` | Read a live field that has a TTL. |
+| `get-nottl` | Read a field that has no TTL. |
 | `getall` | Read all fields of one hash. |
+| `getall-nottl` | Read all fields of one hash whose fields have no TTL. |
 | `incr-ttl` | Increment a counter and renew its TTL. |
+| `incr-nottl` | Increment a counter that has no TTL (`native` still runs `HINCRBY`+`HPERSIST` in `MULTI`, because its contract clears any TTL; `hash` runs `HINCRBY`). |
 | `mixed` | 80% `get`, 20% `set-ttl`. |
 | `presence` | `presence.Registry`: 90% heartbeat, 9% list devices, 1% disconnect. |
 | `cas` | Read value and version, then write back with `VER`; retry on conflict (module and lua only). |
+| `memory` (separate command) | Load every field without TTLs, measure, flush, then load them with a TTL and measure again. The difference is the memory cost of expiry, and the plain hash's TTL-free load is the baseline. |
 | `reclaim` (separate command) | Load all fields with one shared deadline, then measure time and server cost until they are gone without any reads. Also reports bytes per field. |
+
+Each `-nottl` workload repeats its TTL'd counterpart with fields that never expire. Against `hash` it answers "what does each backend cost over a plain hash", and against its own TTL'd twin "what does expiry cost".
 
 ## Build / Run / Test
 
@@ -260,12 +284,12 @@ make report OUT=bench/results/run1
 scripts/ladder.sh bench/results/ladder1 develop=develop lazy=perf/lazy-expire-index tip=perf/embedded-field-table
 ```
 
-`scripts/bench.sh` starts otherwise identical servers from `scripts/valkey-server.sh`: `plain` for `lua` and `native`, and one per module build with TairHash loaded. Both use `io-threads 1`, `hz 10`, have persistence off, and have diagnostics on: `latency-tracking-info-percentiles "50 90 99 99.9 99.99"`, `latency-monitor-threshold 1` (ms) and `slowlog-log-slower-than 1000` (µs). The script runs the measured repeats, one profiled pass and the reclaim scenario, and writes the following to `OUT`:
+`scripts/bench.sh` starts otherwise identical servers from `scripts/valkey-server.sh`: `plain` for `lua`, `native` and `hash`, and one per module build with TairHash loaded. Both use `io-threads 1`, `hz 10`, have persistence off, and have diagnostics on: `latency-tracking-info-percentiles "50 90 99 99.9 99.99"`, `latency-monitor-threshold 1` (ms) and `slowlog-log-slower-than 1000` (µs). The script runs the measured repeats, one profiled pass, the memory scenario and the reclaim scenario, and writes the following to `OUT`:
 
 - `results.jsonl`
 - `report.md`
 - `runs/<label dir>/<run>/`
-- `run.log` and `reclaim.log`
+- `run.log`, `memory.log` and `reclaim.log`
 - the server logs
 - `host-load.txt`: the host load before and after each pass, the label, and the CPU placement (appended across passes)
 
@@ -281,8 +305,8 @@ SKIP_LOAD=1 PLAIN_BACKENDS= MODULE_ARGS='active_expire_period 100 active_expire_
 `scripts/ladder.sh OUT name=ref...` compares module revisions with each other and with `lua` and `native`:
 
 1. It clones each ref into `.cache/src/` and builds it as `.cache/modules/<name>-scan/`.
-2. It runs the integration suites (`tairhash`, `fieldhash/{module,lua,native}`, `presence`, with `-race`) against a throwaway server with that build loaded. Any failure stops the ladder before benchmarking, because a build that answers differently is not comparable.
-3. It runs `bench.sh` once per workload with every build on its own server, then once for reclaim with `-profile`. Backends are interleaved within each cell, so the paired ratios against the reference (the first name) cancel drift between repeats.
+2. It runs the integration suites (`tairhash`, `fieldhash/{module,lua,native}`, `presence`, `internal/plainhash`, with `-race`) against a throwaway server with that build loaded. Any failure stops the ladder before benchmarking, because a build that answers differently is not comparable.
+3. It runs `bench.sh` once per workload with every build on its own server, then once for the memory scenario and reclaim with `-profile`. Backends are interleaved within each cell, so the paired ratios against the reference (the first name) cancel drift between repeats.
 
 `OUT/ladder.txt` lists each name's ref, commit, subject, `-march` flags from `compile_commands.json` and conformance verdict, plus chunk start times. Each chunk takes the host lock separately and appends to the same results, so a failed chunk can be rerun on its own with `WORKLOADS=<name> SKIP_RECLAIM=1` into a fresh directory, and both rendered together with `thbench report -reference <name> A/results.jsonl B/results.jsonl`.
 
@@ -313,19 +337,20 @@ Each run brackets its measured window with `CONFIG RESETSTAT`, `SLOWLOG RESET` a
 | `memory.*` | `used_memory`, dataset, overhead, Lua VM (`vm_functions`, `vm_eval`), RSS and fragmentation at the end, plus deltas. |
 | `slowlog`, `latency_events` | SLOWLOG entries (≥ 1 ms) and latency-monitor events (≥ 1 ms) in the window. |
 | `server_profile.summary` (profiled pass) | Main-thread phase and component breakdown, top self/cumulative functions, and unclassified leaves. |
+| Memory: `no_ttl.*`, `ttl.*` (`bytes_per_field`, `dataset_bytes_per_field`, `memory_usage_per_field`, `encoding`) | The same load measurements as reclaim's, once without TTLs and once with. `encoding` is `OBJECT ENCODING` of each physical key behind one logical key: a 10-field plain hash with 64-byte values stays `listpack`, while a hash with field TTLs is a `hashtable`. The report's expire overhead is `ttl` minus `no_ttl`; "vs hash" divides by the plain hash's `no_ttl`. |
 | Reclaim: `bytes_per_field`, `dataset_bytes_per_field`, `memory_usage_per_field` | `used_memory` growth, `used_memory_dataset` growth and exact `MEMORY USAGE` per field. `used_memory` is the cross-backend number of record: `MEMORY USAGE` of a module key reports whatever the module's `mem_usage` callback returns. |
 | Reclaim: `idle_busy_per_sec`, `busy_us_per_field` | The empty server's background busy rate, measured over `-idle-window` before loading, and the reclaim work per field: Δ`eventloop_duration_sum` in the window minus harness commands minus `idle_busy_per_sec` × window, divided by fields reclaimed. `server_metrics.busy_us_per_op` is the same without the idle subtraction. |
 | Reclaim: `server_metrics.busy_us_per_op` | Main-thread cost per reclaimed field, including module timers, core active expiry and client-driven sweeping for `lua`, net of the harness's polling. The window opens 500 ms before the deadline, so reclamation that starts the moment the deadline passes is inside it. The `lua` sweeper starts at the deadline itself. |
 
 ### Artifacts
 
-`-artifacts-dir` gets one directory per run at `<label dir>/<run>`. The run is `<backend>-<workload>-c<conc>-r<repeat>`, `...-profile`, `reclaim-<backend>` or `reclaim-<backend>-profile`, and is also stored as `run` in each result. Each result also records `backend_type` and, for module servers, `server.tairhash_revision`, read from `source-revision` next to the loaded `.so`. The label directory is the label with every run of characters outside `[A-Za-z0-9._@+-]` collapsed to `-`. When that changes the label, an 8-hex-digit hash of the original is appended so distinct labels never share a directory. Without a label, runs sit directly under `-artifacts-dir`.
+`-artifacts-dir` gets one directory per run at `<label dir>/<run>`. The run is `<backend>-<workload>-c<conc>-r<repeat>`, `...-profile`, `memory-<backend>`, `reclaim-<backend>` or `reclaim-<backend>-profile`, and is also stored as `run` in each result. Each result also records `backend_type` and, for module servers, `server.tairhash_revision`, read from `source-revision` next to the loaded `.so`. The label directory is the label with every run of characters outside `[A-Za-z0-9._@+-]` collapsed to `-`. When that changes the label, an 8-hex-digit hash of the original is appended so distinct labels never share a directory. Without a label, runs sit directly under `-artifacts-dir`.
 
 | File | Content |
 |---|---|
-| `info.before.txt`, `info.after.txt` | Full `INFO everything` + `INFO debug` bracketing the window (reclaim: baseline, loaded, deadline (taken 500 ms before it), done). |
+| `info.before.txt`, `info.after.txt` | Full `INFO everything` + `INFO debug` bracketing the window (reclaim: baseline, loaded, deadline (taken 500 ms before it), done; memory: `info.baseline.<nottl\|ttl>.txt`, `info.loaded.<nottl\|ttl>.txt`). |
 | `config.txt` | `CONFIG GET *`. |
-| `memory-stats.txt` | `MEMORY STATS` at the end of the window. |
+| `memory-stats.txt` | `MEMORY STATS` at the end of the window (memory: `memory-stats.<nottl\|ttl>.txt` after each load). |
 | `slowlog.json`, `latency.json` | SLOWLOG entries; `LATENCY LATEST` and `LATENCY HISTORY` per event. |
 | `timeline.jsonl` | Per-second utilization, CPU, command rate, loop cycles, network bytes, expired fields, memory, clients. |
 | `module-expire.*.txt` | `EXHEXPIREINFO` (module server only). |
@@ -385,10 +410,11 @@ go/
 ├── internal/
 │   ├── conformance/       shared behavioural suite every backend passes
 │   ├── testserver/        integration-test connection and database allocation
+│   ├── plainhash/         plain-hash baseline (HSET/HGET/...; no TTLs)
 │   ├── serverprof/        sample/perf → pprof, folded stacks, main-thread phase breakdown
-│   └── bench/             workloads, backend specs, runner, server snapshots + metrics, timeline, interference, artifacts, reclaim, report
+│   └── bench/             workloads, backend specs, runner, server snapshots + metrics, timeline, interference, artifacts, memory, reclaim, report
 ├── cmd/
-│   ├── thbench/           benchmark CLI (run / reclaim / report / profile)
+│   ├── thbench/           benchmark CLI (run / memory / reclaim / report / profile / workloads)
 │   └── presence-demo/     runnable use-case demo
 ├── scripts/               valkey-server.sh (canonical server flags), bench.sh (orchestration), ladder.sh (revision ladder)
 └── Makefile
