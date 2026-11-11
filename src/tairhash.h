@@ -18,6 +18,8 @@
 #include <stdio.h>
 
 #include "dict.h"
+#include "alloc_size.h"
+#include "fieldtable.h"
 #include "list.h"
 #include "redismodule.h"
 #include "skiplist.h"
@@ -59,17 +61,13 @@
 #define Module_Assert(_e) ((_e) ? (void)0 : (_moduleAssert(#_e, __FILE__, __LINE__), abort()))
 
 /*
- * We use `version` and `expire` as part of the tairhash value. This may be different
- * from the expire on the redis key. Redis regards `expire` as part of the database, not
- * part of the key. For example, after you perform a restore on a key, the original expire
- * will be Lost unless you specify ttl again. The `version` and `expire` of tairhash will
- * be completely recovered after the restore.
+ * Each field (see TairHashField in fieldtable.h) carries `version` and `expire` as part
+ * of the tairhash value. This may be different from the expire on the redis key. Redis
+ * regards `expire` as part of the database, not part of the key. For example, after you
+ * perform a restore on a key, the original expire will be Lost unless you specify ttl
+ * again. The `version` and `expire` of tairhash will be completely recovered after the
+ * restore.
  */
-typedef struct TairHashVal {
-    long long version;
-    long long expire;
-    RedisModuleString *value;
-} TairHashVal;
 
 /*
  * `expire_index` is allocated on the first field that gets a TTL, so a hash that never
@@ -77,7 +75,7 @@ typedef struct TairHashVal {
  * length.
  */
 typedef struct tairHashObj {
-    dict *hash;
+    fieldTable hash;
 #if defined SLAB_MODE
     tairhash_zskiplist *expire_index;
 #else
