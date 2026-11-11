@@ -138,7 +138,7 @@ void activeExpire(RedisModuleCtx *ctx, int dbid, uint64_t keys_per_loop) {
         }
 
         tair_hash_obj = RedisModule_ModuleTypeGetValue(real_key);
-        if (dictSize(tair_hash_obj->hash) == 1) {
+        if (ftSize(&tair_hash_obj->hash) == 1) {
             may_delkey = 1;
         }
         RedisModule_CloseKey(real_key);
@@ -232,7 +232,7 @@ void passiveExpire(RedisModuleCtx *ctx, int dbid, RedisModuleString *key) {
         }
 
         tair_hash_obj = RedisModule_ModuleTypeGetValue(real_key);
-        if (dictSize(tair_hash_obj->hash) == 1) {
+        if (ftSize(&tair_hash_obj->hash) == 1) {
             may_delkey = 1;
         }
         RedisModule_CloseKey(real_key);
@@ -293,7 +293,10 @@ void deleteAndPropagate(RedisModuleCtx *ctx, int dbid, RedisModuleString *key, t
         RedisModuleString *key_dup = RedisModule_CreateStringFromString(NULL, key);
         RedisModuleString *field_dup = RedisModule_CreateStringFromString(NULL, field);
         m_zslDelete(obj->expire_index, expire, field_dup, NULL);
-        m_dictDelete(obj->hash, field);
+        /* `field` may be the expire index's own copy, freed with its node above. */
+        size_t field_len;
+        const char *field_ptr = RedisModule_StringPtrLen(field_dup, &field_len);
+        ftDelete(&obj->hash, field_ptr, field_len);
         RedisModule_Replicate(ctx, "EXHDEL", "ss", key_dup, field_dup);
         notifyFieldSpaceEvent("expired", key_dup, field_dup, dbid);
         RedisModule_FreeString(NULL, key_dup);
