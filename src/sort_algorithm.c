@@ -272,7 +272,10 @@ void deleteAndPropagate(RedisModuleCtx *ctx, int dbid, RedisModuleString *key, t
             m_zslDelete(g_expire_index[dbid], before_min_score, key, NULL);
         }
     }
-    m_dictDelete(o->hash, field);
+    /* `field` may be the expire index's own copy, freed with its node above. */
+    size_t field_len;
+    const char *field_ptr = RedisModule_StringPtrLen(field_dup, &field_len);
+    ftDelete(&o->hash, field_ptr, field_len);
     RedisModule_Replicate(ctx, "EXHDEL", "ss", key_dup, field_dup);
     notifyFieldSpaceEvent("expired", key_dup, field_dup, dbid);
     RedisModule_FreeString(NULL, key_dup);
