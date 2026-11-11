@@ -487,6 +487,28 @@ start_server {tags {"tairhash"} overrides {bind 0.0.0.0}} {
         assert_equal 0 [r dbsize]  
     }
 
+    test {Rename and move of other types and of tairhash keys without expiring fields} {
+        r select 8
+        r flushall
+        r set plain v
+        r rename plain plain2
+        r move plain2 9
+        r exhset noexpire f v
+        r rename noexpire noexpire2
+        r del noexpire2
+        assert_equal PONG [r ping]
+
+        # A field given a TTL after the rename must be expired under the new name.
+        r exhset renamed f v
+        r rename renamed renamed2
+        r exhset renamed2 g v px 100
+        wait_for_condition 50 100 {
+            [r exhlen renamed2] == 1
+        } else {
+            fail "field of a renamed tairhash was not actively expired"
+        }
+    }
+
     test {Active expire rdb} {
         r del tairhashkey
 
