@@ -6,16 +6,20 @@
  *           [-n ops] [-P pipeline] [-v value_len] [-s stale_pct] [-S seed]
  *
  * Population workloads write every field of every key once, in key order:
+ *   load        EXHSYNC with a full snapshot (keys end up synced)
  *   loadset     EXHSET ... ABS <version> per field
  *   loadmset    EXHMSET with every field of a key
  *   loadhset    native HSET with an 8-byte version prefix on each value: the memory
  *               baseline for the same data in a plain hash
  *
  * Steady-state workloads pick a random key (and fields) per op:
- *   gt          EXHSET ... GT <version> of one field; `stale_pct`% of ops carry an older
- *               version and get an error reply
+ *   lww         EXHMSETLWW of one field; `stale_pct`% of ops carry an older version
+ *   gt          EXHSET ... GT <version> of one field, the request shape EXHMSETLWW
+ *               replaces; `stale_pct`% of ops carry an older version (error reply)
  *   mset        EXHMSET of `fields_per_write` distinct random fields
- *   getallver   EXHGETALLWITHVER of a whole key
+ *   getallver   EXHGETALLWITHVER of a whole key, the read EXHSYNCGET replaces
+ *   syncget     EXHSYNCGET of a whole key
+ *   sync        EXHSYNCGET then EXHSYNC with a full snapshot (the read-repair path)
  *
  * Prints throughput and the number of error replies; error replies are counted, not fatal.
  */
@@ -48,6 +52,7 @@ typedef struct {
 /* Backing storage for one command's arguments. */
 typedef struct {
     char key[64];
+    char token[24];
     char field[MAX_FIELDS][24];
     char value[MAX_FIELDS][8 + MAX_VALUE_LEN + 1];
     char version[MAX_FIELDS][24];
@@ -64,7 +69,8 @@ static long long now_us(void) {
 
 static void usage(void) {
     fprintf(stderr,
-            "usage: loadgen -w loadset|loadmset|loadhset|gt|mset|getallver [-h host] [-p port] [-k keys] [-f fields]\n"
+            "usage: loadgen -w load|loadset|loadmset|loadhset|lww|gt|mset|getallver|syncget|sync [-h host] [-p port]\n"
+            "               [-k keys] [-f fields]\n"
             "               [-m fields_per_write] [-n ops] [-P pipeline] [-v value_len] [-s stale_pct] [-S seed]\n");
     exit(2);
 }
@@ -116,6 +122,24 @@ static void build_full_key(Command *cmd, const Config *cfg, long k, long long ve
     }
 }
 
+/* Every field of key k as one EXHSYNC with token 0: nothing written before the snapshot
+ * may be removed, and every snapshot carries all fields, so this exercises the same
+ * merge path as read-repair. */
+static void build_sync(Command *cmd, const Config *cfg, long k, long long version) {
+    cmd->argc = 0;
+    set_key(cmd, k);
+    arg_str(cmd, "EXHSYNC");
+    arg_str(cmd, cmd->key);
+    snprintf(cmd->token, sizeof(cmd->token), "0");
+    arg_str(cmd, cmd->token);
+    for (long f = 0; f < cfg->fields; f++) {
+        set_field(cmd, (int)f, f, k + f, cfg->value_len, version);
+        arg_str(cmd, cmd->field[f]);
+        arg(cmd, cmd->value[f], cfg->value_len);
+        arg_str(cmd, cmd->version[f]);
+    }
+}
+
 /* `n` distinct fields of key k, starting at a random field, as one EXHMSET. */
 static void build_mset(Command *cmd, const Config *cfg, long k, long n, long op) {
     cmd->argc = 0;
@@ -130,12 +154,14 @@ static void build_mset(Command *cmd, const Config *cfg, long k, long n, long op)
     }
 }
 
-/* Appends the command for operation `op`. */
-static void append_op(redisContext *c, const Config *cfg, Command *cmd, long op, long long base_version) {
+/* Appends the commands for operation `op`; returns how many replies to expect. */
+static int append_op(redisContext *c, const Config *cfg, Command *cmd, long op, long long base_version) {
     const char *w = cfg->workload;
     long long version = base_version + op;
 
-    if (!strcmp(w, "loadmset") || !strcmp(w, "loadhset")) {
+    if (!strcmp(w, "load")) {
+        build_sync(cmd, cfg, op, version);
+    } else if (!strcmp(w, "loadmset") || !strcmp(w, "loadhset")) {
         build_full_key(cmd, cfg, op, version, !strcmp(w, "loadhset"));
     } else if (!strcmp(w, "loadset")) {
         long k = op / cfg->fields, f = op % cfg->fields;
@@ -150,13 +176,31 @@ static void append_op(redisContext *c, const Config *cfg, Command *cmd, long op,
         arg_str(cmd, cmd->version[0]);
     } else {
         long k = random() % cfg->keys;
-        if (!strcmp(w, "mset")) {
+        if (!strcmp(w, "sync")) {
+            set_key(cmd, k);
+            redisAppendCommand(c, "EXHSYNCGET %s", cmd->key);
+            build_sync(cmd, cfg, k, version);
+            redisAppendCommandArgv(c, cmd->argc, cmd->argv, cmd->argvlen);
+            return 2;
+        } else if (!strcmp(w, "mset")) {
             build_mset(cmd, cfg, k, cfg->fields_per_write, op);
-        } else if (!strcmp(w, "getallver")) {
+        } else if (!strcmp(w, "getallver") || !strcmp(w, "syncget")) {
             cmd->argc = 0;
             set_key(cmd, k);
-            arg_str(cmd, "EXHGETALLWITHVER");
+            arg_str(cmd, !strcmp(w, "syncget") ? "EXHSYNCGET" : "EXHGETALLWITHVER");
             arg_str(cmd, cmd->key);
+        } else if (!strcmp(w, "lww")) {
+            if (cfg->stale_pct > 0 && random() % 100 < cfg->stale_pct) {
+                version = base_version - 1 - random() % 1000000;
+            }
+            cmd->argc = 0;
+            set_key(cmd, k);
+            set_field(cmd, 0, random() % cfg->fields, op, cfg->value_len, version);
+            arg_str(cmd, "EXHMSETLWW");
+            arg_str(cmd, cmd->key);
+            arg_str(cmd, cmd->field[0]);
+            arg(cmd, cmd->value[0], cfg->value_len);
+            arg_str(cmd, cmd->version[0]);
         } else if (!strcmp(w, "gt")) {
             if (cfg->stale_pct > 0 && random() % 100 < cfg->stale_pct) {
                 version = base_version - 1 - random() % 1000000;
@@ -175,6 +219,7 @@ static void append_op(redisContext *c, const Config *cfg, Command *cmd, long op,
         }
     }
     redisAppendCommandArgv(c, cmd->argc, cmd->argv, cmd->argvlen);
+    return 1;
 }
 
 int main(int argc, char **argv) {
@@ -200,7 +245,7 @@ int main(int argc, char **argv) {
         cfg.value_len > MAX_VALUE_LEN || cfg.pipeline <= 0 || cfg.fields_per_write <= 0 || cfg.fields_per_write > cfg.fields) {
         usage();
     }
-    if (!strcmp(cfg.workload, "loadmset") || !strcmp(cfg.workload, "loadhset")) {
+    if (!strcmp(cfg.workload, "load") || !strcmp(cfg.workload, "loadmset") || !strcmp(cfg.workload, "loadhset")) {
         cfg.ops = cfg.keys;
     } else if (!strcmp(cfg.workload, "loadset")) {
         cfg.ops = cfg.keys * cfg.fields;
@@ -221,8 +266,7 @@ int main(int argc, char **argv) {
     for (long op = 0; op < cfg.ops;) {
         int pending = 0;
         for (long i = 0; i < cfg.pipeline && op < cfg.ops; i++, op++) {
-            append_op(c, &cfg, cmd, op, base_version);
-            pending++;
+            pending += append_op(c, &cfg, cmd, op, base_version);
         }
         for (int i = 0; i < pending; i++) {
             redisReply *reply;

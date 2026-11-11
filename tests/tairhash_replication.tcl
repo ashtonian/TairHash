@@ -5,6 +5,23 @@ proc tairhash_server_version {} {
     lrange [split [s redis_version] .] 0 1
 }
 
+# What replication and persistence must reproduce. The compat format carries no write
+# sequence, which DEBUG DIGEST includes, so it is compared by the keys' fields instead.
+proc tairhash_state {client format keys} {
+    if {$format eq {state}} {
+        return [$client debug digest]
+    }
+    set out {}
+    foreach key $keys {
+        set triples {}
+        foreach {f v ver} [$client exhgetallwithver $key] {
+            lappend triples [list $f $v $ver [expr {[$client exhttl $key $f] > 0}]]
+        }
+        lappend out $key [lsort -index 0 $triples]
+    }
+    return $out
+}
+
 proc tairhash_server_at_least {major minor} {
     lassign [tairhash_server_version] ma mi
     expr {$ma > $major || ($ma == $major && $mi >= $minor)}
@@ -20,7 +37,7 @@ start_server {tags {"tairhash replication"} overrides {bind 0.0.0.0}} {
                 set version [dict get $m ver]
             }
         }
-        assert_equal 20000 $version
+        assert_equal 20100 $version
     }
 
     test {EXHSETNX starts a new field at version 1} {
@@ -81,16 +98,17 @@ foreach format {state compat} {
                 r exhset big f$i v$i
             }
             r exhset big ttl v px 100000
-            set digest [r debug digest]
+            set keys {nx ttl big}
+            set before [tairhash_state r $format $keys]
             r debug loadaof
-            assert_equal $digest [r debug digest]
+            assert_equal $before [tairhash_state r $format $keys]
 
             # Replayed from the rewritten base, i.e. TairHashTypeAofRewrite.
             r bgrewriteaof
             waitForBgrewriteaof r
             assert_equal ok [s aof_last_bgrewrite_status]
             r debug loadaof
-            assert_equal $digest [r debug digest]
+            assert_equal $before [tairhash_state r $format $keys]
             assert_equal 1 [r exhver nx f]
             assert {[r exhttl ttl f] > 0}
             assert_equal -1 [r exhttl ttl p]
@@ -131,7 +149,7 @@ foreach format {state compat} {
                 $master exhsetver ttl m1 42
 
                 wait_for_ofs_sync $master $replica
-                assert_equal [$master debug digest] [$replica debug digest]
+                assert_equal [tairhash_state $master $format ttl] [tairhash_state $replica $format ttl]
                 assert_equal -1 [$replica exhttl ttl p]
                 assert {[$replica exhttl ttl keep] > 0}
                 assert {[$replica exhttl ttl n] <= 1000}

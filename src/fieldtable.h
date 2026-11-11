@@ -28,6 +28,7 @@ typedef struct TairHashField {
     struct TairHashField *next;
     long long version;
     long long expire; /* absolute unix time in milliseconds, 0 for none */
+    long long seq;    /* write sequence of the last value write */
     uint32_t name_len;
     uint32_t value_len;
     char data[]; /* name bytes, then value bytes */
@@ -41,7 +42,7 @@ static inline const char *fieldValue(const TairHashField *f) {
     return f->data + f->name_len;
 }
 
-/* A new, unlinked field holding copies of name and value; version and expire are 0. */
+/* A new, unlinked field holding copies of name and value; version, expire and seq are 0. */
 TairHashField *fieldCreate(const char *name, size_t name_len, const char *value, size_t value_len);
 void fieldFree(TairHashField *f);
 

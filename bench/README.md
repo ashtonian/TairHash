@@ -15,12 +15,16 @@ short values and microsecond-timestamp versions.
 
 | Workload | Commands |
 |---|---|
+| `load` | `EXHSYNC key 0 <all fields>` per key (keys end up synced) |
 | `loadset` | `EXHSET key field value ABS version` per field |
 | `loadmset` | `EXHMSET` with every field of a key |
 | `loadhset` | native `HSET` with an 8-byte version prefix per value: the memory baseline |
-| `gt` | `EXHSET ... GT version` of one random field; `--stale` % of ops carry an older version (error reply) |
+| `lww` | `EXHMSETLWW` of one random field; `--stale` % of ops carry an older version |
+| `gt` | `EXHSET ... GT version` of one random field, the request shape `EXHMSETLWW` replaces; `--stale` % of ops carry an older version (error reply) |
 | `mset` | `EXHMSET` of `--fields-per-write` distinct random fields |
 | `getallver` | `EXHGETALLWITHVER` of a whole key |
+| `syncget` | `EXHSYNCGET` of a whole key |
+| `sync` | `EXHSYNCGET`, then `EXHSYNC` with a full snapshot (the read-repair path) |
 
 ## Config
 
@@ -38,7 +42,7 @@ short values and microsecond-timestamp versions.
 | `--fields-per-write` | int | 10 | Fields per `mset` write |
 | `--ops` | int | 4000000 | Operations; size it so the run outlasts the profile |
 | `--pipeline` | int | 64 | Pipeline depth |
-| `--stale` | percent | 10 | Share of `gt` writes with an old version |
+| `--stale` | percent | 10 | Share of `lww` and `gt` writes with an old version |
 | `--seconds` | int | 5 | Profile length |
 | `--port` | int | 27101 | Master port; the replica uses port + 1 |
 | `--replica` | flag | off | Attach a replica and measure its cost of applying the stream |
