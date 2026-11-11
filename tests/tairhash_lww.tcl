@@ -210,10 +210,11 @@ start_server {tags {"tairhash lww"} overrides {bind 0.0.0.0}} {
         assert_error {*WRONGTYPE*} {r exhsyncget str}
     }
 
-    test {Replication-only arguments and commands are rejected from clients} {
+    test {Replication-only commands are rejected from clients} {
         r del k
-        assert_error {*replication stream*} {r exhset k f v seq 5}
+        assert_error {*replication stream*} {r exhmsetrepl k f v 1 0 1}
         assert_error {*replication stream*} {r exhsyncrepl k}
+        assert_error {*syntax*} {r exhset k f v seq 5}
         assert_error {*syntax*} {r exhset k f v abs 0}
         assert_equal 0 [r exists k]
     }
@@ -244,6 +245,7 @@ start_server {tags {"tairhash lww"} overrides {bind 0.0.0.0}} {
         r config set aof-use-rdb-preamble no
         r config set appendonly yes
         waitForBgrewriteaof r
+        assert_equal ok [s aof_last_bgrewrite_status]
 
         # Replayed from the incremental AOF, i.e. the propagated effects.
         r exhsync synced [sync_token r synced] f1 a 10 gone x 1
@@ -252,6 +254,11 @@ start_server {tags {"tairhash lww"} overrides {bind 0.0.0.0}} {
         r exhsetnx nx f v
         r exhset ttl f v ex 1000
         r exhset ttl f v2 keepttl
+        # Larger than one rewrite command's worth of fields.
+        for {set i 0} {$i < 150} {incr i} {
+            r exhset big f$i v$i
+        }
+        r exhset big ttl v px 100000
         set digest [debug_digest]
         r debug loadaof
         assert_equal $digest [debug_digest]
@@ -259,6 +266,7 @@ start_server {tags {"tairhash lww"} overrides {bind 0.0.0.0}} {
         # Replayed from the rewritten base, i.e. TairHashTypeAofRewrite.
         r bgrewriteaof
         waitForBgrewriteaof r
+        assert_equal ok [s aof_last_bgrewrite_status]
         r debug loadaof
         assert_equal $digest [debug_digest]
         assert_equal 1 [lindex [r exhsyncget empty] 0]

@@ -158,7 +158,7 @@ To run a suite by hand instead: replace `your_path` in the suite with the direct
 ## Upgrading
 
 The RDB encoding version is 1. Data written by this version can not be loaded by older
-builds, and older replicas reject the replication stream it produces (`EXHSET ... SEQ`):
+builds, and older replicas reject the replication stream it produces (`EXHMSETREPL`):
 upgrade replicas before their master. Version 0 data loads unchanged.
 
 

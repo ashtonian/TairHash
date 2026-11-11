@@ -1153,14 +1153,18 @@ Return：
 
 #### Replication and persistence
 
-Write commands replicate the resulting state of each field (`EXHSET key field value ABS
-version [PXAT expire] SEQ seq`) instead of the request, so a replica or an AOF replay
-reproduces versions, TTLs and write sequences exactly, independently of its own clock.
-EXHSYNC also emits `EXHSYNCREPL key` to mark the hash synced. The `SEQ` option and
-`EXHSYNCREPL` are accepted only from the replication stream or while loading; a regular
-client gets `ERR only accepted from the replication stream or while loading`.
+Write commands replicate the resulting state of the fields they wrote, as one
+`EXHMSETREPL key field value version expire seq [field value version expire seq ...]`
+per command (expire is an absolute unix time in milliseconds, 0 for none), instead of
+the request, so a replica or an AOF replay reproduces versions, TTLs and write sequences
+exactly, independently of its own clock. EXHSYNC also emits `EXHDEL` for the fields it
+removes and `EXHSYNCREPL key` to mark the hash synced. AOF rewrite emits the same
+commands, 64 fields per `EXHMSETREPL`. `EXHMSETREPL` and `EXHSYNCREPL` are internal: they
+are accepted only from the replication stream or while loading, and a regular client gets
+`ERR only accepted from the replication stream or while loading` (on servers older than
+Redis 6.2, which cannot report where a command comes from, they are always accepted).
 
 The RDB encoding is version 1 (adds the synced flag and per-field write sequences).
 Version 0 data loads as unsynced, with write sequence 0. Data written by this version can
-not be loaded by older builds, and an older replica rejects the `SEQ` option: upgrade
+not be loaded by older builds, and an older replica does not know `EXHMSETREPL`: upgrade
 replicas before their master.
