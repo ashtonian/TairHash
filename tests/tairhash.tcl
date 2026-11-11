@@ -53,6 +53,18 @@ start_server {tags {"tairhash"} overrides {bind 0.0.0.0}} {
         return $counts
     }
 
+    # Objects handed to the lazyfree thread so far; older servers report only the pending count.
+    proc lazyfree_total {} {
+        set total 0
+        foreach field {lazyfreed_objects lazyfree_pending_objects} {
+            set value [s $field]
+            if {$value ne ""} {
+                incr total $value
+            }
+        }
+        return $total
+    }
+
     proc psubscribe {client channels} {
         $client psubscribe {*}$channels
         __consume_subscribe_messages $client psubscribe $channels
@@ -441,6 +453,23 @@ start_server {tags {"tairhash"} overrides {bind 0.0.0.0}} {
         assert { [string match "*db: 8, active_expired_fields: 1*" $info] }
     }
 
+    test {Active expire frees emptied keys synchronously} {
+        # A free effort of 0 tells the server to always free a value asynchronously, which an emptied TairHash must not request.
+        set prev [lindex [r config get lazyfree-lazy-server-del] 1]
+        r config set lazyfree-lazy-server-del yes
+        r del emptiedkey
+        set before [lazyfree_total]
+
+        r exhset emptiedkey field val px 100
+        wait_for_condition 50 100 {
+            [r exists emptiedkey] == 0
+        } else {
+            fail "emptiedkey was not actively expired"
+        }
+        assert_equal $before [lazyfree_total]
+        r config set lazyfree-lazy-server-del $prev
+    }
+
     test {Async flushall/flushdb/unlink} {
         create_big_tairhash_with_expire k1 10000 100
         create_big_tairhash_with_expire k2 10000 100
@@ -516,6 +545,47 @@ start_server {tags {"tairhash"} overrides {bind 0.0.0.0}} {
         } else {
             fail "keys were not actively expired"
         }
+    }
+
+    test {Rename and move keys of other types} {
+        r select 11
+        r del strkey strkey2
+        r set strkey val
+        r rename strkey strkey2
+        r move strkey2 12
+        assert_equal 0 [r exists strkey2]
+        r select 12
+        assert_equal val [r get strkey2]
+        r del strkey2
+        r select 8
+    }
+
+    test {Rename a key without expiring fields, then delete it} {
+        r select 11
+        r del renkey renkey2
+        r exhset renkey f1 v
+        r rename renkey renkey2
+        # The rename must not leave a pending rename behind for the next keyspace event.
+        r del renkey2
+        assert_equal PONG [r ping]
+        r select 8
+    }
+
+    test {Active expire after renaming a key without expiring fields} {
+        r select 11
+        r del renkey renkey2
+        r exhset renkey f1 v
+        r rename renkey renkey2
+        r exhset renkey2 f2 v px 200
+
+        # EXHLEN neither triggers nor filters expiration, so only active expire can bring it to 1.
+        wait_for_condition 50 100 {
+            [r exhlen renkey2] == 1
+        } else {
+            fail "field set after rename was not actively expired"
+        }
+        r del renkey2
+        r select 8
     }
 
     test {Active expire rdb} {
@@ -727,6 +797,42 @@ start_server {tags {"tairhash"} overrides {bind 0.0.0.0}} {
 
         set h_len [r exhlen tairhashkey]
         assert_equal 3 $h_len
+    }
+
+    # MEMORY USAGE reports allocator sizes only where the server has RedisModule_MallocSize
+    # (Redis 6.0+, Valkey); older servers get an estimate.
+    if {[lindex [split [s redis_version] .] 0] >= 6} {
+        test {A hash without expiring fields allocates no expire index} {
+            r del plain ttl
+            r exhset plain f v
+            r exhset ttl f v ex 1000
+            r exhpersist ttl f
+            # The index, once allocated, is dominated by a 64-level skiplist header (~1KB).
+            assert_morethan [expr {[r memory usage ttl] - [r memory usage plain]}] 1000
+        }
+
+        test {MEMORY USAGE tracks the allocator} {
+            r flushall
+            # Valkey frees FLUSHALL on a background thread by default, which would offset used_memory.
+            wait_for_condition 50 100 {
+                [s lazyfree_pending_objects] == 0
+            } else {
+                fail "FLUSHALL was not freed"
+            }
+            # Compare growth between two sizes of the hash, so one-off server allocations (such as
+            # the client's query buffer) land on neither side.
+            for {set i 0} {$i < 2000} {incr i} {
+                r exhset big field:$i [string repeat x 12]
+            }
+            set used_before [s used_memory]
+            set reported_before [r memory usage big]
+            for {set i 2000} {$i < 4000} {incr i} {
+                r exhset big field:$i [string repeat x 12]
+            }
+            set allocated [expr {[s used_memory] - $used_before}]
+            set reported [expr {[r memory usage big] - $reported_before}]
+            assert_lessthan [expr {abs($reported - $allocated)}] [expr {$allocated / 10}]
+        }
     }
 
     test {Exhdelwithver} {
@@ -2295,5 +2401,30 @@ start_server {tags {"slab_bug_reproduce"}} {
         }
 
         assert_equal 0 [r exhlen $key]
+    }
+
+    test "Active expire removes exactly the expired fields of a partially expired key" {
+        set key "test_partial_active_expire"
+        r del $key
+
+        # Interleaved TTLs make every group of lanes in the slab expire partially.
+        for {set i 0} {$i < 64} {incr i} {
+            if {$i % 2 == 0} {
+                r exhset $key field_$i val PX 500
+            } else {
+                r exhset $key field_$i val EX 100
+            }
+        }
+
+        # EXHLEN neither triggers nor filters expiration, so only active expire can bring it to 32.
+        wait_for_condition 100 100 {
+            [r exhlen $key] == 32
+        } else {
+            fail "active expire left [r exhlen $key] fields, expected 32"
+        }
+        for {set i 1} {$i < 64} {incr i 2} {
+            assert_equal 1 [r exhexists $key field_$i]
+        }
+        r del $key
     }
 }
