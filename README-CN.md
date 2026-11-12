@@ -40,8 +40,8 @@
 **优点**：可以运行在低版本的redis中（redis >= 5.0 ）      
 **缺点**：过期淘汰效率较低（相对SORT模式而言，特别是redis中含有过多的干扰key时）  
 
-**使用方式**：以默认选项执行cmake，并重新编译
-### SORT_MODE（排序模式）：
+**使用方式**：cmake的时候加上`-DTAIRHASH_EXPIRE_MODE=scan`选项，并重新编译
+### SORT_MODE（排序模式，默认）：
 
 - 使用两级排序索引，第一级对tairhash主key进行排序，第二级针对每个tairhash内部的field进行排序
 - 第一级排序使用第二级排序里最小的ttl进行排序，因此主key是按照ttl全局有序的
@@ -52,7 +52,7 @@
 **优点**：过期淘汰效率比较高      
 **缺点**：更多的内存消耗  
 
-**使用方式**：cmake的时候加上`-DSORT_MODE=yes`选项，并重新编译
+**使用方式**：默认模式；也可以用`-DTAIRHASH_EXPIRE_MODE=sort`显式指定
 ### SLAB_MODE（slab模式）：
 
 - SLAB模式是一种节省内存，缓存友好，高性能的过期算法
@@ -65,7 +65,7 @@
 
 **缺点**：更多的内存消耗  
 
-**使用方式**：cmake的时候加上`-DSLAB_MODE=yes`选项，并重新编译
+**使用方式**：cmake的时候加上`-DTAIRHASH_EXPIRE_MODE=slab`选项，并重新编译
 
 ## 主动过期
 - 每一次读写field，会触发对这个field自身的过期淘汰操作  
@@ -153,15 +153,43 @@ cmake ../ && make -j
 ./redis-server --loadmodule /path/to/tairhash_module.so
 ./valkey-server --loadmodule /path/to/tairhash_module.so
 ```  
-编译选项（`cmake -D<选项>=ON ../`）：
+编译选项（`cmake -D<选项>=<值> ../`）：
 
 | 选项 | 默认值 | 说明 |
 |---|---|---|
-| `SORT_MODE` / `SLAB_MODE` | `OFF` | 主动过期算法（默认SCAN模式） |
+| `TAIRHASH_EXPIRE_MODE` | `sort` | 主动过期算法：`sort`、`slab` 或 `scan`。`sort` 和 `slab` 需要 Redis 7.0+ 或 Valkey；`scan` 也可以运行在 Redis 5.0 和 6.x 上。`SORT_MODE` 和 `SLAB_MODE` 已不推荐使用，但在未设置 `TAIRHASH_EXPIRE_MODE` 时仍然有效：`ON` 选择对应模式，显式设为 `OFF` 则与以前一样编译为 `scan`。 |
 | `TAIRHASH_NATIVE_ARCH` | `OFF` | 针对编译机器的CPU优化（`-march=native`）。仅适用于在运行机器上编译：这样编译的二进制在其他CPU上可能因SIGILL崩溃，例如在CI上构建的Docker镜像。SLAB模式无需开启即可在运行时选择AVX2路径。 |
 | `TAIRHASH_LTO` | `OFF` | 链接时优化 |
 | `SANITIZER_MODE` | 未设置 | `address`、`undefined` 或 `thread` |
 | `GCOV_MODE` | `OFF` | 覆盖率插桩 |
+
+## 模块参数
+
+在模块路径后以 `name value` 的形式传入参数，例如
+`--loadmodule /path/to/tairhash_module.so replication_format compat`。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `enable_active_expire` | 0或1 | `1` | 是否运行主动过期定时器。关闭后field只会在访问时被动过期。 |
+| `active_expire_period` | 毫秒 | `1000` | 主动过期的执行间隔。 |
+| `active_expire_keys_per_loop` | 整数 | `1000` | 每次主动过期在每个数据库中检查的key数量（SCAN模式下为SCAN的count）。 |
+| `active_expire_dbs_per_loop` | 整数 | `16` | 每次主动过期访问的数据库数量。 |
+| `passive_expire_keys_per_loop` | 整数 | `3` | 每次被动过期检查最多删除的过期field数量。 |
+| `replication_format` | `state` 或 `compat` | `state` | 写入如何传给从节点和AOF：`state` 每次写入发送一条内部命令 `EXHMSETREPL`（或 `EXHMETAREPL`），`compat` 每个field发送一条 `EXHSET`/`EXHSETNX`，TairHash 1.x也能识别。见[从1.x升级](#从1x升级)。在Redis 7.0+和Valkey上它同时是模块配置 `tairhash.replication_format`，可以通过 `CONFIG SET` 在运行时修改；配置文件中的值优先于加载参数。 |
+
+## 从1.x升级
+
+TairHash 2.0把每次写入复制为一条 `EXHMSETREPL` 或 `EXHMETAREPL`，TairHash 1.x不认识这些命令：2.0主节点的1.x从节点会对每次写入记录错误并丢弃该写入。位于MULTI/EXEC或脚本中的写入会连同该事务的其余部分（包括针对其他key和其他类型的命令）一起被丢弃：从节点会中止包含未知命令的事务。RDB编码不变。在所有节点都运行2.0之前，请使用 `replication_format compat`：
+
+1. 所有升级后的节点都以 `replication_format compat` 启动（在Redis 7.0+和Valkey上，也可以在配置文件中写 `tairhash.replication_format compat`）。先升级从节点，进行故障转移，再升级原主节点：故障转移期间1.x节点可能会从2.0节点复制，`compat` 可以保证其正常工作。
+2. 确认每个节点（包括级联的从节点）的 `MODULE LIST` 中 `tairhash` 的 `ver` 为 `20000`：从节点会原样转发其主节点的复制流，因此任意层级的从节点收到的都是顶层主节点发送的内容。
+3. 将所有节点切换为 `state`：在Redis 7.0+和Valkey上执行 `CONFIG SET tairhash.replication_format state`，更早的版本去掉该参数后重启。
+
+降级时，先将所有节点切换回 `compat`，再在每个节点上执行 `BGREWRITEAOF` 使其AOF中不再包含 `EXHMSETREPL` 或 `EXHMETAREPL`，然后替换模块。仍处于 `state` 的节点会把从主节点应用的写入以state格式写入自己的AOF。在Redis 7.0+和Valkey上，升级期间设置 `propagation-error-behavior panic-on-replicas` 可以让无法应用复制流的从节点直接停止，而不是静默地产生数据不一致。
+
+`EXHSETNX` 现在与 `EXHSET` 一样，新field的版本从1开始；1.x中为0，导致之后的 `VER` 检查除0以外对任何版本都会失败。来自复制流或AOF的 `EXHSETNX` 仍然把field的版本置为0：这正是1.x主节点和 `compat` 格式用它表达的含义。在早于Redis 6.0.9的服务端上，模块无法判断命令的来源，此时版本同样从1开始。
+
+默认编译现在使用SORT模式而不是SCAN模式，因此不再能加载到Redis 7.0以下的版本：这些版本请使用 `-DTAIRHASH_EXPIRE_MODE=scan` 编译。切换模式不需要迁移数据，所有模式的RDB编码相同。
 
 ## 测试方法
 

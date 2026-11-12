@@ -36,47 +36,47 @@ count the key's entry in the per-database expire index of SORT_MODE and SLAB_MOD
 skiplist node and a copy of the key name (about 130 bytes for a short name).
 
 ## Active expiration
-### SCAN_MODE(default):
+### SCAN_MODE:
 - Do not sort TairHash globally (Smaller memory overhead)
 - Each TairHash will still use a sort index to sort the fields internally (For expiration efficiency)
 - The built-in timer will periodically use the SCAN command to find the TairHash that contains the expired field, and then check the sort index inside the TairHash to eliminate the field
 - A scan opens every key it visits, whatever its type, so the timer skips it while no TairHash has a field with a TTL
 - The sort index holds its own copy of the name of each field that has a TTL; a field without a TTL is not in it
 
-**Supported server versions**: redis >= 5.0, valkey >= 7.2
+**Supported redis version**: redis >= 5.0
 
 **Advantages**: can run in the low version of redis (redis >= 5.0)  
 
 **Disadvantages**: low efficiency of expire elimination (compared with SORT mode and SLAB mode)  
 
-**Usage**: cmake with default option, and recompile
+**Usage**: cmake with `-DTAIRHASH_EXPIRE_MODE=scan`, and recompile
 
-### SORT_MODE：
+### SORT_MODE (default):
 - Use a two-level sort index, the first level sorts the main key of tairhash, and the second level sorts the fields inside each tairhash
 - The first-level uses the smallest ttl in the second-level for sorting, so the main key is globally ordered
 - The built-in timer will periodically scan the first-level index to find out a key that has expired, and then check the secondary index of these keys to eliminate the expired fields. This is the active expire
 - The first-level index holds its own copy of each key name, and the second-level index its own copy of the name of each field that has a TTL
 
-**Supported server versions**: redis >= 7.0, valkey >= 7.2
+**Supported redis version**: redis >= 7.0
 
 **Advantages**: higher efficiency of expire elimination     
 
 **Disadvantages**: More memory consumption  
 
-**Usage**: cmake with `-DSORT_MODE=yes` option, and recompile
+**Usage**: the default build; `-DTAIRHASH_EXPIRE_MODE=sort` selects it explicitly
 
 ### SLAB_MODE：  
 - Slab mode is a low memory usage (compared with SORT mode), cache-friendly, high-performance expiration algorithm
 - Like SORT mode, keys are globally sorted to ensure that keys that need to be expired can be found faster. Unlike SORT mode, SLAB does not sort the fields inside the key, which saves memory overhead. 
 - The SLAB expiration algorithm uses SIMD instructions (when supported by the hardware) to speed up the search for expired fields
 
-**Supported server versions**: redis >= 7.0, valkey >= 7.2  
+**Supported redis version**: redis >= 7.0  
 
 **Advantages**: Efficient elimination, low memory consumption, and fast access bring new ideas to expiration algorithms   
 
 **Disadvantages**: More memory consumption    
 
-**Usage**: cmake with `-DSLAB_MODE=yes` option, and recompile
+**Usage**: cmake with `-DTAIRHASH_EXPIRE_MODE=slab`, and recompile
 
 ## Passivity expiration  
 - Every time you read or write a field, it will also trigger the expiration of the field itself  
@@ -160,13 +160,12 @@ cd build
 cmake ../ && make -j
 ```
 then the tairhash_module.so library file will be generated in the lib directory
-(`cmake -DTAIRHASH_OUTPUT_DIR=<dir> ../` writes it to another directory).
 
-Build options (`cmake -D<option>=ON ../`):
+Build options (`cmake -D<option>=<value> ../`):
 
 | Option | Default | Description |
 |---|---|---|
-| `SORT_MODE` / `SLAB_MODE` | `OFF` | Active expire algorithm (default: SCAN mode) |
+| `TAIRHASH_EXPIRE_MODE` | `sort` | Active expire algorithm: `sort`, `slab` or `scan` (see [Active expiration](#active-expiration)). `sort` and `slab` need Redis 7.0+ or Valkey; `scan` also runs on Redis 5.0 and 6.x. `SORT_MODE` and `SLAB_MODE` are deprecated but still honoured when `TAIRHASH_EXPIRE_MODE` is not set: `ON` selects that mode, and an explicit `OFF` builds `scan`, as it did before. |
 | `TAIRHASH_NATIVE_ARCH` | `OFF` | Optimize for the build host's CPU (`-march=native`). Only for a library built on the host that runs it: a binary built this way can crash with SIGILL on another CPU, for example a Docker image built on a CI runner. SLAB mode picks its AVX2 path at runtime without it. |
 | `TAIRHASH_LTO` | `OFF` | Link-time optimization |
 | `SANITIZER_MODE` | unset | `address`, `undefined` or `thread` |
@@ -174,34 +173,63 @@ Build options (`cmake -D<option>=ON ../`):
 
 ```
 ./redis-server --loadmodule /path/to/tairhash_module.so
-./valkey-server --loadmodule /path/to/tairhash_module.so
 ```  
+
+## Module options
+
+Pass options as `name value` pairs after the module path, for example
+`--loadmodule /path/to/tairhash_module.so replication_format compat`.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `enable_active_expire` | 0 or 1 | `1` | Run the active expire timer. Without it fields expire only passively, when accessed. |
+| `active_expire_period` | milliseconds | `1000` | Interval between active expire cycles. |
+| `active_expire_keys_per_loop` | integer | `1000` | Keys (SCAN mode: the SCAN count) examined per database per active expire cycle. |
+| `active_expire_dbs_per_loop` | integer | `16` | Databases visited per active expire cycle. |
+| `passive_expire_keys_per_loop` | integer | `3` | Expired fields removed per passive expiry check. |
+| `replication_format` | `state` or `compat` | `state` | How writes reach replicas and the AOF: `state` sends one internal `EXHMSETREPL` (or `EXHMETAREPL`) per write, `compat` one `EXHSET`/`EXHSETNX` per field, which TairHash 1.x also accepts. See [Upgrading from 1.x](#upgrading-from-1x). On Redis 7.0+ and Valkey it is also the module config `tairhash.replication_format`, which `CONFIG SET` changes at runtime; a value for it in the config file takes precedence over the load argument. |
+
+## Upgrading from 1.x
+
+TairHash 2.0 replicates each write as one `EXHMSETREPL` or `EXHMETAREPL`, which TairHash 1.x
+does not know: a 1.x replica of a 2.0 master logs an error for every write and drops it. A
+write inside a MULTI/EXEC or a script takes the rest of that transaction with it, commands
+on other keys and of other types included: the replica aborts a transaction that holds a
+command it does not know. The RDB encoding is unchanged. Upgrade with
+`replication_format compat` until every node runs 2.0:
+
+1. Start every upgraded node with `replication_format compat` (on Redis 7.0+ and Valkey,
+   `tairhash.replication_format compat` in the config file works too). Upgrade replicas
+   first, fail over, then upgrade the former masters: a 1.x node may then replicate from a
+   2.0 node during the failover, which `compat` keeps working.
+2. Confirm that `MODULE LIST` reports `ver 20000` for `tairhash` on every node, including
+   chained replicas: a replica passes its master's stream on unchanged, so replicas at
+   every depth receive what the top-level master sends.
+3. Switch every node to `state`: `CONFIG SET tairhash.replication_format state` on Redis
+   7.0+ and Valkey, or a restart without the option on older servers.
+
+To downgrade, switch every node back to `compat` first, then run `BGREWRITEAOF` on each
+node so that its AOF holds no `EXHMSETREPL` or `EXHMETAREPL`, and replace the module. A
+node still in `state` writes what it applies from its master to its own AOF in the state
+format. On Redis 7.0+ and Valkey, setting
+`propagation-error-behavior panic-on-replicas` during the upgrade makes a replica that
+cannot apply the stream stop instead of silently diverging.
+
+`EXHSETNX` now starts a new field at version 1, as `EXHSET` does; 1.x left it at 0, so a
+later `VER` check failed for every version but 0. Applied from the replication stream or
+the AOF, `EXHSETNX` still leaves the field at version 0: that is what a 1.x master and the
+`compat` format mean by it. On a server older than Redis 6.0.9 the module cannot tell where
+a command comes from, and the field starts at version 1 there too.
+
+A default build now uses SORT mode instead of SCAN mode, so it no longer loads on servers older
+than Redis 7.0: build those with `-DTAIRHASH_EXPIRE_MODE=scan`. Switching modes needs no data
+migration, since the RDB encoding is the same in every mode.
 ## TEST
 
-`tests/run.sh` builds the module and runs the TCL suites in `tests/` inside a Redis or
-Valkey source tree's test framework. CI runs every job through it, so a local run executes
-the same steps as CI. The server tree is cloned and built once under `.deps/` and reused;
-each module variant builds into its own directory under `build/`.
+1. Modify the path in the tairhash.tcl file in the `tests` directory to `set testmodule [file your_path/tairhash_module.so]`
+2. Add the path of the tairhash.tcl file in the `tests` directory to the all_tests of redis test_helper.tcl
+3. run ./runtest --single tairhash
 
-```
-tests/run.sh                                  # every suite, scan mode, against Redis 7.0
-tests/run.sh --mode sort --suite tairhash     # one suite, another expire mode
-tests/run.sh --sanitizer address              # module and server built with ASan
-tests/run.sh --coverage                       # line/function coverage of the module
-tests/run.sh --server-ref 7.2 -- --baseport 25000   # another server branch, extra runtest args
-tests/run.sh --server valkey --server-ref 9.1.3     # against Valkey
-```
-
-Requirements: a C toolchain, CMake 3.10+, git and Tcl 8.5+. On macOS the
-`Exhincrbyfloat*` tests fail because `long double` is 64-bit there; they pass on Linux.
-
-To run a suite by hand instead: replace `your_path` in the suite with the directory of
-`tairhash_module.so`, copy it to `tests/unit/type/` in a Redis or Valkey source tree and
-run `./runtest --single unit/type/<suite>`.
-
-CI runs every suite against Redis 5.0, 6.2, 7.0, 7.2, 7.4 and 8.10 and Valkey 7.2, 8.1 and
-9.1, on x86-64 and arm64. Redis 7.0 runs every expire mode, and SCAN and SORT mode also under
-AddressSanitizer; Redis 8.10 and Valkey 9.1 run SCAN mode under AddressSanitizer too.
 
 ## Client
 
