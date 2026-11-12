@@ -567,6 +567,22 @@ void startExpireTimer(RedisModuleCtx *ctx, void *data) {
     g_expire_timer_id = RedisModule_CreateTimer(ctx, g_expire_algorithm.active_expire_period, activeExpireTimerHandler, data);
 }
 
+/* Converts a TTL argument t, in seconds when `seconds` is set, to a unix time in milliseconds
+ * counted from `base` (0 for an absolute time). Fails if the result does not fit. */
+static int expireToAbsoluteMs(long long t, int seconds, long long base, long long *ms) {
+    if (seconds) {
+        if (t > LLONG_MAX / 1000) {
+            return REDISMODULE_ERR;
+        }
+        t *= 1000;
+    }
+    if (t > LLONG_MAX - base) {
+        return REDISMODULE_ERR;
+    }
+    *ms = t + base;
+    return REDISMODULE_OK;
+}
+
 /* Field expiry earlier in a write command may have emptied the hash; a write that then fails
  * must not leave the empty hash behind. */
 static void abortWrite(RedisModuleCtx *ctx, RedisModuleKey *key, RedisModuleString *keyname, tairHashObj *o) {
@@ -638,6 +654,14 @@ int tairHashExpireGenericFunc(RedisModuleCtx *ctx, RedisModuleString **argv, int
 
     if (milliseconds < 0) {
         RedisModule_ReplyWithError(ctx, TAIRHASH_ERRORMSG_SYNTAX);
+        return REDISMODULE_ERR;
+    }
+
+    /* A TTL of 0 expires the field at once. */
+    if (milliseconds == 0) {
+        milliseconds = 1;
+    } else if (expireToAbsoluteMs(milliseconds, unit == UNIT_SECONDS, basetime, &milliseconds) != REDISMODULE_OK) {
+        RedisModule_ReplyWithError(ctx, TAIRHASH_ERRORMSG_INVALID_EXPIRE);
         return REDISMODULE_ERR;
     }
 
@@ -718,14 +742,9 @@ int tairHashExpireGenericFunc(RedisModuleCtx *ctx, RedisModuleString **argv, int
                 return REDISMODULE_ERR;
             }
         }
-
-        if (milliseconds == 0) {
-            milliseconds = 1;
-        } else {
-            if (unit == UNIT_SECONDS) {
-                milliseconds *= 1000;
-            }
-            milliseconds += basetime;
+        if (!(ex_flags & (TAIR_HASH_SET_WITH_ABS_VER | TAIR_HASH_SET_WITH_GT_VER)) && tair_hash_val->version == LLONG_MAX) {
+            RedisModule_ReplyWithError(ctx, TAIRHASH_ERRORMSG_VERSION_OVERFLOW);
+            return REDISMODULE_ERR;
         }
 
         if (milliseconds > 0) {
@@ -915,6 +934,14 @@ int TairHashTypeHset_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv,
         return REDISMODULE_ERR;
     }
 
+    /* Computed before anything changes, so that an expire that does not fit is rejected cleanly. */
+    if (expire_p && expire > 0 &&
+        expireToAbsoluteMs(expire, ex_flags & TAIR_HASH_SET_EX, (ex_flags & TAIR_HASH_SET_ABS_EXPIRE) ? 0 : RedisModule_Milliseconds(),
+                           &milliseconds) != REDISMODULE_OK) {
+        RedisModule_ReplyWithError(ctx, TAIRHASH_ERRORMSG_INVALID_EXPIRE);
+        return REDISMODULE_ERR;
+    }
+
     if ((NULL != version_p) && (RedisModule_StringToLongLong(version_p, &version) != REDISMODULE_OK)) {
         RedisModule_ReplyWithError(ctx, TAIRHASH_ERRORMSG_SYNTAX);
         return REDISMODULE_ERR;
@@ -973,6 +1000,10 @@ int TairHashTypeHset_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv,
                 return REDISMODULE_ERR;
             }
         }
+        if (!(ex_flags & (TAIR_HASH_SET_WITH_ABS_VER | TAIR_HASH_SET_WITH_GT_VER)) && tair_hash_val->version == LLONG_MAX) {
+            RedisModule_ReplyWithError(ctx, TAIRHASH_ERRORMSG_VERSION_OVERFLOW);
+            return REDISMODULE_ERR;
+        }
     }
 
     if (ex_flags & (TAIR_HASH_SET_WITH_ABS_VER | TAIR_HASH_SET_WITH_GT_VER)) {
@@ -981,16 +1012,7 @@ int TairHashTypeHset_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv,
         tair_hash_val->version += 1;
     }
 
-    if (0 < expire) {
-        if (ex_flags & TAIR_HASH_SET_EX) {
-            expire *= 1000;
-        }
-        if (ex_flags & TAIR_HASH_SET_ABS_EXPIRE) {
-            milliseconds = expire;
-        } else {
-            milliseconds = RedisModule_Milliseconds() + expire;
-        }
-    } else if (expire_p && expire == 0) {
+    if (expire_p && expire == 0) {
         milliseconds = 1;
     }
 
@@ -1110,6 +1132,17 @@ int TairHashTypeHmset_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv
         tair_hash_obj = RedisModule_ModuleTypeGetValue(key);
     }
 
+    /* Each pair increments the version of its field, a repeated field once per pair: reject
+     * the write before changing anything if that could take a version past LLONG_MAX. */
+    long long pairs = (argc - 2) / 2;
+    for (int i = 2; i < argc; i += 2) {
+        TairHashVal *tair_hash_val = (TairHashVal *)m_dictFetchValue(tair_hash_obj->hash, argv[i]);
+        if (tair_hash_val != NULL && tair_hash_val->version > LLONG_MAX - pairs) {
+            RedisModule_ReplyWithError(ctx, TAIRHASH_ERRORMSG_VERSION_OVERFLOW);
+            return REDISMODULE_ERR;
+        }
+    }
+
     int dbid = RedisModule_GetSelectedDb(ctx);
     for (int i = 2; i < argc; i += 2) {
         fieldExpireIfNeeded(ctx, dbid, argv[1], tair_hash_obj, argv[i], 0);
@@ -1157,6 +1190,8 @@ int TairHashTypeHmsetWithOpts_RedisCommand(RedisModuleCtx *ctx, RedisModuleStrin
 
     long long ver;
     long long when;
+    long long now = RedisModule_Milliseconds();
+    long long fields = (argc - 2) / 4;
 
     int nokey;
     int dbid = RedisModule_GetSelectedDb(ctx);
@@ -1165,6 +1200,11 @@ int TairHashTypeHmsetWithOpts_RedisCommand(RedisModuleCtx *ctx, RedisModuleStrin
             ver < 0 || when < 0) {
             abortWrite(ctx, key, argv[1], tair_hash_obj);
             RedisModule_ReplyWithError(ctx, TAIRHASH_ERRORMSG_SYNTAX);
+            return REDISMODULE_ERR;
+        }
+        if (expireToAbsoluteMs(when, 1, now, &when) != REDISMODULE_OK) {
+            abortWrite(ctx, key, argv[1], tair_hash_obj);
+            RedisModule_ReplyWithError(ctx, TAIRHASH_ERRORMSG_INVALID_EXPIRE);
             return REDISMODULE_ERR;
         }
 
@@ -1176,6 +1216,12 @@ int TairHashTypeHmsetWithOpts_RedisCommand(RedisModuleCtx *ctx, RedisModuleStrin
         if (tair_hash_val != NULL && ver != 0 && tair_hash_val->version != ver) {
             abortWrite(ctx, key, argv[1], tair_hash_obj);
             RedisModule_ReplyWithError(ctx, TAIRHASH_ERRORMSG_VERSION);
+            return REDISMODULE_ERR;
+        }
+        /* Each entry increments the version of its field, a repeated field once per entry. */
+        if (tair_hash_val != NULL && tair_hash_val->version > LLONG_MAX - fields) {
+            abortWrite(ctx, key, argv[1], tair_hash_obj);
+            RedisModule_ReplyWithError(ctx, TAIRHASH_ERRORMSG_VERSION_OVERFLOW);
             return REDISMODULE_ERR;
         }
     }
@@ -1213,8 +1259,8 @@ int TairHashTypeHmsetWithOpts_RedisCommand(RedisModuleCtx *ctx, RedisModuleStrin
         tair_hash_val->value = takeAndRef(argv[i + 1]);
         tair_hash_val->version++;
 
-        int dbid = RedisModule_GetSelectedDb(ctx);
-        when = RedisModule_Milliseconds() + when * 1000;
+        /* Cannot overflow: the loop above checked it. */
+        expireToAbsoluteMs(when, 1, now, &when);
         if (nokey || tair_hash_val->expire == 0) {
             g_expire_algorithm.insert(ctx, dbid, argv[1], tair_hash_obj, argv[i], when);
         } else {
@@ -1521,6 +1567,14 @@ int TairHashTypeHincrBy_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **ar
         return REDISMODULE_ERR;
     }
 
+    /* Computed before anything changes, so that an expire that does not fit is rejected cleanly. */
+    if (expire_p && expire > 0 &&
+        expireToAbsoluteMs(expire, ex_flags & TAIR_HASH_SET_EX, (ex_flags & TAIR_HASH_SET_ABS_EXPIRE) ? 0 : RedisModule_Milliseconds(),
+                           &milliseconds) != REDISMODULE_OK) {
+        RedisModule_ReplyWithError(ctx, TAIRHASH_ERRORMSG_INVALID_EXPIRE);
+        return REDISMODULE_ERR;
+    }
+
     if ((NULL != version_p) && (RedisModule_StringToLongLong(version_p, &version) != REDISMODULE_OK)) {
         RedisModule_ReplyWithError(ctx, TAIRHASH_ERRORMSG_SYNTAX);
         return REDISMODULE_ERR;
@@ -1591,6 +1645,10 @@ int TairHashTypeHincrBy_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **ar
                 return REDISMODULE_ERR;
             }
         }
+        if (!(ex_flags & (TAIR_HASH_SET_WITH_ABS_VER | TAIR_HASH_SET_WITH_GT_VER)) && tair_hash_val->version == LLONG_MAX) {
+            RedisModule_ReplyWithError(ctx, TAIRHASH_ERRORMSG_VERSION_OVERFLOW);
+            return REDISMODULE_ERR;
+        }
     }
 
     if ((incr < 0 && cur_val < 0 && incr < (LLONG_MIN - cur_val)) || (incr > 0 && cur_val > 0 && incr > (LLONG_MAX - cur_val)) || (max_p != NULL && cur_val + incr > max) || (min_p != NULL && cur_val + incr < min)) {
@@ -1621,16 +1679,7 @@ int TairHashTypeHincrBy_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **ar
     }
     tair_hash_val->value = RedisModule_CreateStringFromLongLong(NULL, cur_val);
 
-    if (0 < expire) {
-        if (ex_flags & TAIR_HASH_SET_EX) {
-            expire *= 1000;
-        }
-        if (ex_flags & TAIR_HASH_SET_ABS_EXPIRE) {
-            milliseconds = expire;
-        } else {
-            milliseconds = RedisModule_Milliseconds() + expire;
-        }
-    } else if (expire_p && expire == 0) {
+    if (expire_p && expire == 0) {
         milliseconds = 1;
     }
 
@@ -1753,6 +1802,14 @@ int TairHashTypeHincrByFloat_RedisCommand(RedisModuleCtx *ctx, RedisModuleString
         return REDISMODULE_ERR;
     }
 
+    /* Computed before anything changes, so that an expire that does not fit is rejected cleanly. */
+    if (expire_p && expire > 0 &&
+        expireToAbsoluteMs(expire, ex_flags & TAIR_HASH_SET_EX, (ex_flags & TAIR_HASH_SET_ABS_EXPIRE) ? 0 : RedisModule_Milliseconds(),
+                           &milliseconds) != REDISMODULE_OK) {
+        RedisModule_ReplyWithError(ctx, TAIRHASH_ERRORMSG_INVALID_EXPIRE);
+        return REDISMODULE_ERR;
+    }
+
     if ((NULL != version_p) && (RedisModule_StringToLongLong(version_p, &version) != REDISMODULE_OK)) {
         RedisModule_ReplyWithError(ctx, TAIRHASH_ERRORMSG_SYNTAX);
         return REDISMODULE_ERR;
@@ -1822,6 +1879,10 @@ int TairHashTypeHincrByFloat_RedisCommand(RedisModuleCtx *ctx, RedisModuleString
                 return REDISMODULE_ERR;
             }
         }
+        if (!(ex_flags & (TAIR_HASH_SET_WITH_ABS_VER | TAIR_HASH_SET_WITH_GT_VER)) && tair_hash_val->version == LLONG_MAX) {
+            RedisModule_ReplyWithError(ctx, TAIRHASH_ERRORMSG_VERSION_OVERFLOW);
+            return REDISMODULE_ERR;
+        }
     }
 
     if (isnan(cur_val + incr) || isinf(cur_val + incr)) {
@@ -1864,16 +1925,7 @@ int TairHashTypeHincrByFloat_RedisCommand(RedisModuleCtx *ctx, RedisModuleString
     }
     tair_hash_val->value = RedisModule_CreateString(NULL, dbuf, dlen);
 
-    if (0 < expire) {
-        if (ex_flags & TAIR_HASH_SET_EX) {
-            expire *= 1000;
-        }
-        if (ex_flags & TAIR_HASH_SET_ABS_EXPIRE) {
-            milliseconds = expire;
-        } else {
-            milliseconds = RedisModule_Milliseconds() + expire;
-        }
-    } else if (expire_p && expire == 0) {
+    if (expire_p && expire == 0) {
         milliseconds = 1;
     }
 
