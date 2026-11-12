@@ -38,7 +38,11 @@ ifeq ($(MODULE_MODE),sort)
 MODULE_CMAKE_FLAGS := -DSORT_MODE=ON
 else ifeq ($(MODULE_MODE),slab)
 MODULE_CMAKE_FLAGS := -DSLAB_MODE=ON
-else ifneq ($(MODULE_MODE),scan)
+else ifeq ($(MODULE_MODE),scan)
+# Named explicitly, so a revision whose default build is another mode still builds scan.
+# Revisions without the option ignore it and build their scan default.
+MODULE_CMAKE_FLAGS := -DTAIRHASH_EXPIRE_MODE=scan
+else
 $(error MODULE_MODE must be scan, sort or slab)
 endif
 
