@@ -2448,3 +2448,55 @@ start_server {tags {"tairhash active-expire-budget"}} {
         assert_equal PONG [r ping]
     }
 }
+
+start_server {tags {"tairhash passive-expire"}} {
+    # Without active expire only passive expiry and lazy reads remove fields, and the server's
+    # own key expiry runs only when a key is accessed.
+    r module load $testmodule enable_active_expire 0
+    r debug set-active-expire 0
+
+    test {Passive expire skips a key that its own TTL removed} {
+        r select 12
+        r del k1 other
+        r exhset k1 f v PX 100
+        r pexpire k1 100
+        after 300
+        assert_equal 1 [r exhset other f v]
+        assert_equal 0 [r exists k1]
+        r del other
+    }
+
+    test {Expire index entries of a key dropped while loading are skipped} {
+        r select 12
+        r flushdb
+        r exhset k2 f v PX 200
+        r pexpire k2 50
+        after 100
+        # k2 is saved with an expired key TTL and dropped while loading, after its field was indexed.
+        r debug reload
+        assert_equal 0 [r exists k2]
+        r set k2 str
+        after 300
+        assert_equal 1 [r exhset other f v]
+        assert_equal str [r get k2]
+        r del k2 other
+    }
+
+    test {A stale expire index entry does not shadow a later TairHash of the same name} {
+        r select 12
+        r flushdb
+        r exhset k3 f v PX 200
+        r pexpire k3 50
+        after 100
+        r debug reload
+        r exhset k3 g v PX 1500
+        after 300
+        assert_equal 1 [r exhset other f v]
+        after 1500
+        assert_equal 1 [r exhset other f2 v]
+        assert_equal {} [r exhget k3 g]
+        assert_equal 0 [r exists k3]
+        r del other
+    }
+}
+
