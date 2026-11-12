@@ -22,6 +22,14 @@
 - Support efficient active expiration (SCAN mode, SORT mode and SLAB mode) and passivity expiration for field
 - Support field expired event notification (based on pubsub)
 
+## Memory
+
+Each field is one allocation holding its name, value, version and TTL, chained directly into
+the hash table. A key of 30 fields with 8-byte names and values takes about 1.9KB in all
+(`bench/profile.sh`, Redis 7.0, jemalloc), against about 5.2KB with one dict entry, value
+struct and two string objects per field. The expire index is allocated only once a field of
+the key gets a TTL. `MEMORY USAGE` reports what the allocator actually holds for a key.
+
 ## Active expiration
 ### SCAN_MODE(default):
 - Do not sort TairHash globally (Smaller memory overhead)
