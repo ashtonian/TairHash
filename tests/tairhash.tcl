@@ -2719,3 +2719,25 @@ start_server {tags {"tairhash databases"} overrides {databases 32}} {
     }
 }
 
+start_server {tags {"tairhash lazyfree"}} {
+    r module load $testmodule
+
+    test {A hash freed on the lazyfree thread inside a transaction} {
+        # More than 64 fields make UNLINK free the hash on the lazyfree thread while EXEC still
+        # holds the arguments of the writes queued before it.
+        set args {}
+        for {set i 0} {$i < 100} {incr i} {
+            lappend args f$i v$i 0 100
+        }
+        for {set round 0} {$round < 20} {incr round} {
+            r multi
+            r exhmsetwithopts lk {*}$args
+            r exhset lk extra v EX 100
+            r unlink lk
+            r exec
+        }
+        assert_equal 0 [r exists lk]
+        assert_equal PONG [r ping]
+    }
+}
+

@@ -77,9 +77,12 @@ void tairHashValRelease(struct TairHashVal *o) {
     }
 }
 
-RedisModuleString *takeAndRef(RedisModuleString *str) {
-    RedisModule_RetainString(NULL, str);
-    return str;
+/* A copy of str for a TairHash to keep. Client arguments are copied rather than retained: in a
+ * transaction the client holds its arguments until EXEC returns, while a later command of the
+ * transaction can free the hash on the lazyfree thread, and both would update the reference
+ * count of a shared string at once. */
+RedisModuleString *ownString(RedisModuleString *str) {
+    return RedisModule_CreateStringFromString(NULL, str);
 }
 
 /* Members of g_expire_index are the index's own copies of key names, never a retained obj->key.
@@ -1040,9 +1043,9 @@ int TairHashTypeHset_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv,
         RedisModule_FreeString(NULL, tair_hash_val->value);
     }
 
-    tair_hash_val->value = takeAndRef(argv[3]);
+    tair_hash_val->value = ownString(argv[3]);
     if (nokey) {
-        m_dictAdd(tair_hash_obj->hash, takeAndRef(skey), tair_hash_val);
+        m_dictAdd(tair_hash_obj->hash, ownString(skey), tair_hash_val);
         RedisModule_ReplyWithLongLong(ctx, 1);
     } else {
         RedisModule_ReplyWithLongLong(ctx, 0);
@@ -1103,8 +1106,8 @@ int TairHashTypeHsetNx_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **arg
         return REDISMODULE_OK;
     }
 
-    tair_hash_val->value = takeAndRef(svalue);
-    m_dictAdd(tair_hash_obj->hash, takeAndRef(skey), tair_hash_val);
+    tair_hash_val->value = ownString(svalue);
+    m_dictAdd(tair_hash_obj->hash, ownString(skey), tair_hash_val);
 
     RedisModule_ReplicateVerbatim(ctx);
     RedisModule_ReplyWithLongLong(ctx, 1);
@@ -1162,10 +1165,10 @@ int TairHashTypeHmset_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv
                 RedisModule_FreeString(NULL, tair_hash_val->value);
             }
         }
-        tair_hash_val->value = takeAndRef(argv[i + 1]);
+        tair_hash_val->value = ownString(argv[i + 1]);
         tair_hash_val->version++;
         if (nokey) {
-            m_dictAdd(tair_hash_obj->hash, takeAndRef(argv[i]), tair_hash_val);
+            m_dictAdd(tair_hash_obj->hash, ownString(argv[i]), tair_hash_val);
         }
     }
 
@@ -1262,7 +1265,7 @@ int TairHashTypeHmsetWithOpts_RedisCommand(RedisModuleCtx *ctx, RedisModuleStrin
             RedisModule_FreeString(NULL, tair_hash_val->value);
         }
 
-        tair_hash_val->value = takeAndRef(argv[i + 1]);
+        tair_hash_val->value = ownString(argv[i + 1]);
         tair_hash_val->version++;
 
         /* Cannot overflow: the loop above checked it. */
@@ -1275,7 +1278,7 @@ int TairHashTypeHmsetWithOpts_RedisCommand(RedisModuleCtx *ctx, RedisModuleStrin
         tair_hash_val->expire = when;
 
         if (nokey) {
-            m_dictAdd(tair_hash_obj->hash, takeAndRef(argv[i]), tair_hash_val);
+            m_dictAdd(tair_hash_obj->hash, ownString(argv[i]), tair_hash_val);
         }
 
         v[vlen++] = RedisModule_CreateStringFromString(ctx, argv[1]);
@@ -1704,7 +1707,7 @@ int TairHashTypeHincrBy_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **ar
     }
 
     if (nokey) {
-        m_dictAdd(tair_hash_obj->hash, takeAndRef(skey), tair_hash_val);
+        m_dictAdd(tair_hash_obj->hash, ownString(skey), tair_hash_val);
     }
 
     if (milliseconds > 0) {
@@ -1950,7 +1953,7 @@ int TairHashTypeHincrByFloat_RedisCommand(RedisModuleCtx *ctx, RedisModuleString
     }
 
     if (nokey) {
-        m_dictAdd(tair_hash_obj->hash, takeAndRef(skey), tair_hash_val);
+        m_dictAdd(tair_hash_obj->hash, ownString(skey), tair_hash_val);
     }
 
     if (milliseconds > 0) {
@@ -2923,13 +2926,12 @@ void *TairHashTypeRdbLoad(RedisModuleIO *rdb, int encver) {
         TairHashVal *hashv = createTairHashVal();
         hashv->version = version;
         hashv->expire = expire;
-        hashv->value = takeAndRef(value);
-        m_dictAdd(o->hash, takeAndRef(skey), hashv);
+        /* Loaded strings belong to the module already. */
+        hashv->value = value;
+        m_dictAdd(o->hash, skey, hashv);
         if (hashv->expire) {
             g_expire_algorithm.insert(NULL, dbid, NULL, o, skey, hashv->expire);
         }
-        RedisModule_FreeString(NULL, value);
-        RedisModule_FreeString(NULL, skey);
     }
 
     return o;
