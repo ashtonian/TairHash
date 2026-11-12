@@ -2689,3 +2689,33 @@ start_server {tags {"tairhash failed-writes"}} {
     }
 }
 
+start_server {tags {"tairhash databases"} overrides {databases 32}} {
+    r module load $testmodule
+
+    test {Fields expire in databases past the 16th} {
+        r select 20
+        r del k
+        r exhset k f v PX 100
+        r exhset k g v
+        wait_for_condition 50 100 {
+            [r exhlen k] == 1
+        } else {
+            fail "the field in db 20 was not actively expired"
+        }
+        assert_match {*db: 20, active_expired_fields: 1,*} [r exhexpireinfo]
+
+        r select 31
+        r del m
+        r exhset m f v PX 300
+        r move m 25
+        r select 25
+        wait_for_condition 50 100 {
+            [r exists m] == 0
+        } else {
+            fail "the field moved to db 25 was not actively expired"
+        }
+        r flushall
+        r select 9
+    }
+}
+

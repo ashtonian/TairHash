@@ -43,7 +43,14 @@ static int redis_minor_ver = 0;
 static int redis_patch_ver = 0;
 
 #if defined(SORT_MODE) || defined(SLAB_MODE)
-m_zskiplist *g_expire_index[DB_NUM];
+m_zskiplist **g_expire_index;
+
+m_zskiplist *dbExpireIndex(int dbid) {
+    if (g_expire_index[dbid] == NULL) {
+        g_expire_index[dbid] = m_zslCreate();
+    }
+    return g_expire_index[dbid];
+}
 #endif
 
 RedisModuleTimerID g_expire_timer_id;
@@ -266,7 +273,7 @@ void activeExpireTimerHandler(RedisModuleCtx *ctx, void *data) {
     long long start = RedisModule_Milliseconds();
 
     for (int i = 0; i < dbs_per_call; ++i) {
-        current_db = current_db % DB_NUM;
+        current_db = current_db % g_expire_algorithm.db_num;
         if (RedisModule_SelectDb(ctx, current_db) != REDISMODULE_OK) {
             current_db++;
             continue;
@@ -341,6 +348,9 @@ long long tairHashMinExpire(const tairHashObj *o) {
  * returned list owns their key names. */
 list *popDueExpireIndexEntries(int dbid, long long now, long limit) {
     list *keys = m_listCreate();
+    if (g_expire_index[dbid] == NULL) {
+        return keys;
+    }
     m_zskiplistNode *ln = g_expire_index[dbid]->header->level[0].forward;
     unsigned int taken = 0;
     while (ln && limit-- > 0 && ln->score <= now) {
@@ -420,14 +430,10 @@ void flushDbCallback(RedisModuleCtx *ctx, RedisModuleEvent e, uint64_t sub, void
 
     RedisModuleFlushInfo *fi = data;
     if (sub == REDISMODULE_SUBEVENT_FLUSHDB_START) {
-        if (fi->dbnum != -1) {
-            /* Free and Re-Create index. */
-            m_zslFree(g_expire_index[fi->dbnum]);
-            g_expire_index[fi->dbnum] = m_zslCreate();
-        } else {
-            for (int i = 0; i < DB_NUM; i++) {
+        for (int i = 0; i < g_expire_algorithm.db_num; i++) {
+            if ((fi->dbnum == -1 || fi->dbnum == i) && g_expire_index[i]) {
                 m_zslFree(g_expire_index[i]);
-                g_expire_index[i] = m_zslCreate();
+                g_expire_index[i] = NULL;
             }
         }
     }
@@ -491,14 +497,14 @@ static int keySpaceNotification(RedisModuleCtx *ctx, int type, const char *event
             long long previous_index = tairHashMinExpire(tair_hash_obj);
             int indexed = previous_index != -1;
             if (indexed) {
-                m_zslDelete(g_expire_index[local_from_dbid], previous_index, local_from_key, NULL);
+                m_zslDelete(dbExpireIndex(local_from_dbid), previous_index, local_from_key, NULL);
             }
             if (tair_hash_obj->key) {
                 RedisModule_FreeString(NULL, tair_hash_obj->key);
                 tair_hash_obj->key = RedisModule_CreateStringFromString(NULL, local_to_key);
             }
             if (indexed) {
-                m_zslInsert(g_expire_index[local_to_dbid], previous_index, expireIndexMember(tair_hash_obj));
+                m_zslInsert(dbExpireIndex(local_to_dbid), previous_index, expireIndexMember(tair_hash_obj));
             }
         }
 
@@ -535,8 +541,8 @@ void infoFunc(RedisModuleInfoCtx *ctx, int for_crash_report) {
 
     RedisModule_InfoAddSection(ctx, "ActiveExpiredFields");
     char buf[10];
-    for (int i = 0; i < DB_NUM; ++i) {
-        if (g_expire_index[i]->length == 0 && g_expire_algorithm.stat_active_expired_field[i] == 0) {
+    for (int i = 0; i < g_expire_algorithm.db_num; ++i) {
+        if ((g_expire_index[i] == NULL || g_expire_index[i]->length == 0) && g_expire_algorithm.stat_active_expired_field[i] == 0) {
             continue;
         }
         snprintf(buf, sizeof(buf), "db%d", i);
@@ -544,8 +550,8 @@ void infoFunc(RedisModuleInfoCtx *ctx, int for_crash_report) {
     }
 
     RedisModule_InfoAddSection(ctx, "PassiveExpiredFields");
-    for (int i = 0; i < DB_NUM; ++i) {
-        if (g_expire_index[i]->length == 0 && g_expire_algorithm.stat_passive_expired_field[i] == 0) {
+    for (int i = 0; i < g_expire_algorithm.db_num; ++i) {
+        if ((g_expire_index[i] == NULL || g_expire_index[i]->length == 0) && g_expire_algorithm.stat_passive_expired_field[i] == 0) {
             continue;
         }
         snprintf(buf, sizeof(buf), "db%d", i);
@@ -2869,7 +2875,7 @@ int TairHashTypeActiveExpireInfo_RedisCommand(RedisModuleCtx *ctx, RedisModuleSt
     strncat(buf, DB_DETAIL, d_len);
     t_size += d_len;
 
-    for (int i = 0; i < DB_NUM; ++i) {
+    for (int i = 0; i < g_expire_algorithm.db_num; ++i) {
         if (g_expire_algorithm.stat_active_expired_field[i] == 0 && g_expire_algorithm.stat_passive_expired_field[i] == 0) {
             continue;
         }
@@ -3066,7 +3072,7 @@ void TairHashTypeUnlink2(RedisModuleKeyOptCtx *ctx, const void *value) {
     long long min_expire = tairHashMinExpire(o);
     if (min_expire != -1) {
         /* UNLINK is a synchronous call, so ExpireNode can be safely deleted here. */
-        m_zslDelete(g_expire_index[dbid], min_expire, o->key, NULL);
+        m_zslDelete(dbExpireIndex(dbid), min_expire, o->key, NULL);
     }
 }
 
@@ -3198,6 +3204,29 @@ int Module_CreateCommands(RedisModuleCtx *ctx) {
     return REDISMODULE_OK;
 }
 
+/* The number of databases of the server. The module API has no call for it, and selecting a
+ * database past the last one fails, so search for the first index that cannot be selected.
+ * The search selects on a thread-safe context, which has a client of its own: the context
+ * RedisModule_OnLoad gets has none on Redis 5.0, where selecting on it crashes. */
+static int serverDbCount(void) {
+    RedisModuleCtx *ctx = RedisModule_GetThreadSafeContext(NULL);
+    int lo = 1, hi = 1; /* databases 0..lo-1 exist, database hi does not once the loop below ends */
+    while (RedisModule_SelectDb(ctx, hi) == REDISMODULE_OK) {
+        lo = hi + 1;
+        hi = hi > INT_MAX / 2 ? INT_MAX : hi * 2;
+    }
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (RedisModule_SelectDb(ctx, mid) == REDISMODULE_OK) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    RedisModule_FreeThreadSafeContext(ctx);
+    return lo;
+}
+
 int __attribute__((visibility("default"))) RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     REDISMODULE_NOT_USED(argv);
     REDISMODULE_NOT_USED(argc);
@@ -3209,6 +3238,10 @@ int __attribute__((visibility("default"))) RedisModule_OnLoad(RedisModuleCtx *ct
         RedisModule_Log(ctx, "warning", "Invalid number of arguments passed");
         return REDISMODULE_ERR;
     }
+
+    g_expire_algorithm.db_num = serverDbCount();
+    g_expire_algorithm.stat_active_expired_field = RedisModule_Calloc(g_expire_algorithm.db_num, sizeof(uint64_t));
+    g_expire_algorithm.stat_passive_expired_field = RedisModule_Calloc(g_expire_algorithm.db_num, sizeof(uint64_t));
 
     if (RedisModule_GetServerVersion) {
         int version = RedisModule_GetServerVersion();
@@ -3303,9 +3336,7 @@ int __attribute__((visibility("default"))) RedisModule_OnLoad(RedisModuleCtx *ct
     }
 
 #if defined(SORT_MODE) || defined(SLAB_MODE)
-    for (int i = 0; i < DB_NUM; i++) {
-        g_expire_index[i] = m_zslCreate();
-    }
+    g_expire_index = RedisModule_Calloc(g_expire_algorithm.db_num, sizeof(*g_expire_index));
 
     RedisModule_SubscribeToServerEvent(ctx, RedisModuleEvent_SwapDB, swapDbCallback);
     RedisModule_SubscribeToServerEvent(ctx, RedisModuleEvent_FlushDB, flushDbCallback);
