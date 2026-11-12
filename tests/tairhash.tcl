@@ -2530,3 +2530,55 @@ start_server {tags {"tairhash passive-expire"}} {
         }
     }
 }
+
+start_server {tags {"tairhash watch"}} {
+    r module load $testmodule
+
+    test {Reads do not touch watched keys} {
+        r del wk
+        r exhset wk f v
+        r exhset wk g v EX 100
+        r watch wk
+        r exhget wk f
+        r exhgetwithver wk f
+        r exhmget wk f g
+        r exhmgetwithver wk f g
+        r exhver wk f
+        r exhttl wk g
+        r exhpttl wk g
+        r exhexists wk f
+        r exhstrlen wk f
+        r exhlen wk
+        r exhkeys wk
+        r exhvals wk
+        r exhgetall wk
+        r exhgetallwithver wk
+        r exhscan wk 0
+        r multi
+        r ping
+        assert_equal PONG [r exec]
+    }
+
+    test {A read that expires a field touches watched keys} {
+        r del wk
+        r exhset wk f v PX 50
+        r exhset wk g v
+        r watch wk
+        after 100
+        assert_equal {} [r exhget wk f]
+        r multi
+        r ping
+        assert_equal {} [r exec]
+    }
+
+    test {A read that expires the last field deletes the key} {
+        foreach cmd {exhget exhgetwithver exhver exhexists exhstrlen exhttl} {
+            r del wk
+            r exhset wk f v PX 50
+            after 100
+            r $cmd wk f
+            assert_equal 0 [r exists wk]
+        }
+    }
+}
+
