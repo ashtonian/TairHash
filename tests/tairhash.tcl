@@ -53,6 +53,18 @@ start_server {tags {"tairhash"} overrides {bind 0.0.0.0}} {
         return $counts
     }
 
+    # Objects handed to the lazyfree thread so far; older servers report only the pending count.
+    proc lazyfree_total {} {
+        set total 0
+        foreach field {lazyfreed_objects lazyfree_pending_objects} {
+            set value [s $field]
+            if {$value ne ""} {
+                incr total $value
+            }
+        }
+        return $total
+    }
+
     proc psubscribe {client channels} {
         $client psubscribe {*}$channels
         __consume_subscribe_messages $client psubscribe $channels
@@ -441,6 +453,23 @@ start_server {tags {"tairhash"} overrides {bind 0.0.0.0}} {
         assert { [string match "*db: 8, active_expired_fields: 1*" $info] }
     }
 
+    test {Active expire frees emptied keys synchronously} {
+        # A free effort of 0 tells the server to always free a value asynchronously, which an emptied TairHash must not request.
+        set prev [lindex [r config get lazyfree-lazy-server-del] 1]
+        r config set lazyfree-lazy-server-del yes
+        r del emptiedkey
+        set before [lazyfree_total]
+
+        r exhset emptiedkey field val px 100
+        wait_for_condition 50 100 {
+            [r exists emptiedkey] == 0
+        } else {
+            fail "emptiedkey was not actively expired"
+        }
+        assert_equal $before [lazyfree_total]
+        r config set lazyfree-lazy-server-del $prev
+    }
+
     test {Async flushall/flushdb/unlink} {
         create_big_tairhash_with_expire k1 10000 100
         create_big_tairhash_with_expire k2 10000 100
@@ -516,6 +545,94 @@ start_server {tags {"tairhash"} overrides {bind 0.0.0.0}} {
         } else {
             fail "keys were not actively expired"
         }
+    }
+
+    test {RESTORE under another name tracks the new name} {
+        r select 11
+        r del rk rk2
+        r exhset rk f1 v EX 100
+        r exhset rk f2 v PX 300
+        r restore rk2 0 [r dump rk]
+        # The copy's expire index entries must be found under its own name.
+        assert_equal 1 [r exhdel rk2 f1]
+        assert_equal 1 [r exhdel rk f1]
+        # Reuse the source name for another type; active expire must still reach the copy.
+        r del rk
+        r set rk str
+        wait_for_condition 50 100 {
+            [r exists rk2] == 0
+        } else {
+            fail "rk2 was not actively expired"
+        }
+        assert_equal str [r get rk]
+        r del rk
+        r select 8
+    }
+
+    test {Rename and move keys of other types} {
+        r select 11
+        r del strkey strkey2
+        r set strkey val
+        r rename strkey strkey2
+        r move strkey2 12
+        assert_equal 0 [r exists strkey2]
+        r select 12
+        assert_equal val [r get strkey2]
+        r del strkey2
+        r select 8
+    }
+
+    test {Writes to expiring fields after RENAME and MOVE} {
+        r select 11
+        r del rmk rmk2 rmk3
+        r exhset rmk f1 v EX 100
+        r exhset rmk f2 v EX 200
+        r rename rmk rmk2
+        assert_equal 1 [r exhdel rmk2 f1]
+        assert_equal 1 [r exhexpire rmk2 f2 300]
+        r move rmk2 12
+        r select 12
+        assert_equal 1 [r exhexpire rmk2 f2 400]
+        assert_equal 1 [r exhdel rmk2 f2]
+        assert_equal 0 [r exists rmk2]
+
+        # RENAME onto a TairHash that has expiring fields of its own.
+        r select 11
+        r exhset rmk f v EX 100
+        r exhset rmk3 g v EX 50
+        r rename rmk rmk3
+        assert_equal {} [r exhget rmk3 g]
+        assert_equal 1 [r exhdel rmk3 f]
+        assert_equal 0 [r exists rmk3]
+        r select 8
+    }
+
+    test {Rename a key without expiring fields, then delete it} {
+        r select 11
+        r del renkey renkey2
+        r exhset renkey f1 v
+        r rename renkey renkey2
+        # The rename must not leave a pending rename behind for the next keyspace event.
+        r del renkey2
+        assert_equal PONG [r ping]
+        r select 8
+    }
+
+    test {Active expire after renaming a key without expiring fields} {
+        r select 11
+        r del renkey renkey2
+        r exhset renkey f1 v
+        r rename renkey renkey2
+        r exhset renkey2 f2 v px 200
+
+        # EXHLEN neither triggers nor filters expiration, so only active expire can bring it to 1.
+        wait_for_condition 50 100 {
+            [r exhlen renkey2] == 1
+        } else {
+            fail "field set after rename was not actively expired"
+        }
+        r del renkey2
+        r select 8
     }
 
     test {Active expire rdb} {
@@ -727,6 +844,42 @@ start_server {tags {"tairhash"} overrides {bind 0.0.0.0}} {
 
         set h_len [r exhlen tairhashkey]
         assert_equal 3 $h_len
+    }
+
+    # MEMORY USAGE reports allocator sizes only where the server has RedisModule_MallocSize
+    # (Redis 6.0+, Valkey); older servers get an estimate.
+    if {[lindex [split [s redis_version] .] 0] >= 6} {
+        test {A hash without expiring fields allocates no expire index} {
+            r del plain ttl
+            r exhset plain f v
+            r exhset ttl f v ex 1000
+            r exhpersist ttl f
+            # The index, once allocated, is dominated by a 64-level skiplist header (~1KB).
+            assert_morethan [expr {[r memory usage ttl] - [r memory usage plain]}] 1000
+        }
+
+        test {MEMORY USAGE tracks the allocator} {
+            r flushall
+            # Valkey frees FLUSHALL on a background thread by default, which would offset used_memory.
+            wait_for_condition 50 100 {
+                [s lazyfree_pending_objects] == 0
+            } else {
+                fail "FLUSHALL was not freed"
+            }
+            # Compare growth between two sizes of the hash, so one-off server allocations (such as
+            # the client's query buffer) land on neither side.
+            for {set i 0} {$i < 2000} {incr i} {
+                r exhset big field:$i [string repeat x 12]
+            }
+            set used_before [s used_memory]
+            set reported_before [r memory usage big]
+            for {set i 2000} {$i < 4000} {incr i} {
+                r exhset big field:$i [string repeat x 12]
+            }
+            set allocated [expr {[s used_memory] - $used_before}]
+            set reported [expr {[r memory usage big] - $reported_before}]
+            assert_lessthan [expr {abs($reported - $allocated)}] [expr {$allocated / 10}]
+        }
     }
 
     test {Exhdelwithver} {
@@ -2296,4 +2449,375 @@ start_server {tags {"slab_bug_reproduce"}} {
 
         assert_equal 0 [r exhlen $key]
     }
+
+    test "Active expire removes exactly the expired fields of a partially expired key" {
+        # A random mix of TTLs gives the groups of four lanes every combination of on-time and
+        # timed-out fields, and sizes that are not a multiple of 8 also run the scalar tail.
+        expr {srand(20261111)}
+        foreach size {61 67 200} {
+            set key "test_partial_active_expire_$size"
+            r del $key
+            set keep {}
+            for {set i 0} {$i < $size} {incr i} {
+                if {rand() < 0.5} {
+                    r exhset $key field_$i val PX 500
+                } else {
+                    r exhset $key field_$i val EX 100
+                    lappend keep field_$i
+                }
+            }
+
+            # EXHLEN neither triggers nor filters expiration, so only active expire can shrink it.
+            set want [llength $keep]
+            wait_for_condition 100 100 {
+                [r exhlen $key] == $want
+            } else {
+                fail "active expire left [r exhlen $key] of $size fields, expected $want"
+            }
+            assert_equal [lsort $keep] [lsort [r exhkeys $key]]
+            r del $key
+        }
+    }
 }
+
+start_server {tags {"tairhash active-expire-budget"}} {
+    # A small per-loop budget makes one active expire cycle stop partway through its keys.
+    r module load $testmodule active_expire_keys_per_loop 10
+
+    test {Active expire leaves keys after the spent budget intact} {
+        # Each key expires part of its fields, so the first key ends the cycle on a partially
+        # expired slab and spends the budget; the cycle must not touch the keys after it.
+        for {set k 0} {$k < 8} {incr k} {
+            r del budget$k
+            for {set i 0} {$i < 10} {incr i} {
+                r exhset budget$k short$i v PX 150
+            }
+            r exhset budget$k keep1 v EX 1000
+            r exhset budget$k keep2 v EX 1000
+        }
+
+        # EXHLEN neither triggers nor filters expiration, so only active expire can bring it to 2.
+        for {set k 0} {$k < 8} {incr k} {
+            wait_for_condition 100 100 {
+                [r exhlen budget$k] == 2
+            } else {
+                fail "budget$k has [r exhlen budget$k] fields, expected 2"
+            }
+        }
+        for {set k 0} {$k < 8} {incr k} {
+            assert_equal v [r exhget budget$k keep1]
+            assert_equal 1 [r exhdel budget$k keep1]
+            assert {[r exhttl budget$k keep2] > 900}
+            assert_equal 1 [r exhdel budget$k keep2]
+            assert_equal 0 [r exists budget$k]
+        }
+        assert_equal PONG [r ping]
+    }
+}
+
+start_server {tags {"tairhash passive-expire"}} {
+    # Without active expire only passive expiry and lazy reads remove fields, and the server's
+    # own key expiry runs only when a key is accessed.
+    r module load $testmodule enable_active_expire 0
+    r debug set-active-expire 0
+
+    test {Passive expire skips a key that its own TTL removed} {
+        r select 12
+        r del k1 other
+        r exhset k1 f v PX 100
+        r pexpire k1 100
+        after 300
+        assert_equal 1 [r exhset other f v]
+        assert_equal 0 [r exists k1]
+        r del other
+    }
+
+    test {Expire index entries of a key dropped while loading are skipped} {
+        r select 12
+        r flushdb
+        r exhset k2 f v PX 200
+        r pexpire k2 50
+        after 100
+        # k2 is saved with an expired key TTL and dropped while loading, after its field was indexed.
+        r debug reload
+        assert_equal 0 [r exists k2]
+        r set k2 str
+        after 300
+        assert_equal 1 [r exhset other f v]
+        assert_equal str [r get k2]
+        r del k2 other
+    }
+
+    test {A stale expire index entry does not shadow a later TairHash of the same name} {
+        r select 12
+        r flushdb
+        r exhset k3 f v PX 200
+        r pexpire k3 50
+        after 100
+        r debug reload
+        r exhset k3 g v PX 1500
+        after 300
+        assert_equal 1 [r exhset other f v]
+        after 1500
+        assert_equal 1 [r exhset other f2 v]
+        assert_equal {} [r exhget k3 g]
+        assert_equal 0 [r exists k3]
+        r del other
+    }
+
+    test {EXHSETNX treats an expired field as absent} {
+        r select 12
+        r del nx
+        # More expired fields than one passive expiry pass removes.
+        for {set i 1} {$i <= 5} {incr i} {
+            r exhset nx f$i v PX [expr {40 + $i}]
+        }
+        after 200
+        assert_equal 1 [r exhsetnx nx f5 new]
+        assert_equal new [r exhget nx f5]
+        assert_equal 0 [r exhsetnx nx f5 newer]
+        r del nx
+    }
+
+    start_server {} {
+        r module load $testmodule enable_active_expire 0
+        set master [srv 0 client]
+        set replica [srv -1 client]
+        $replica slaveof [srv 0 host] [srv 0 port]
+        wait_for_condition 50 100 {
+            [string match {*master_link_status:up*} [$replica info replication]]
+        } else {
+            fail "Can't turn the instance into a replica"
+        }
+
+        test {Passive expire on a replica leaves deletions to the master} {
+            $master select 13
+            $master del k
+            for {set i 1} {$i <= 5} {incr i} {
+                $master exhset k f$i v PX 150
+            }
+            $master wait 1 5000
+            after 400
+            # The writes run passive expiry on the master, which replicates the deletions; the replica
+            # runs the same writes and must leave its expire index for those deletions.
+            for {set i 1} {$i <= 3} {incr i} {
+                $master exhsetnx other$i f v
+            }
+            $master wait 1 5000
+            assert_equal PONG [$replica ping]
+            assert_equal [$master debug digest] [$replica debug digest]
+            $replica slaveof no one
+        }
+    }
+}
+
+start_server {tags {"tairhash watch"}} {
+    r module load $testmodule
+
+    test {Reads do not touch watched keys} {
+        r del wk
+        r exhset wk f v
+        r exhset wk g v EX 100
+        r watch wk
+        r exhget wk f
+        r exhgetwithver wk f
+        r exhmget wk f g
+        r exhmgetwithver wk f g
+        r exhver wk f
+        r exhttl wk g
+        r exhpttl wk g
+        r exhexists wk f
+        r exhstrlen wk f
+        r exhlen wk
+        r exhkeys wk
+        r exhvals wk
+        r exhgetall wk
+        r exhgetallwithver wk
+        r exhscan wk 0
+        r multi
+        r ping
+        assert_equal PONG [r exec]
+    }
+
+    test {A read that expires a field touches watched keys} {
+        r del wk
+        r exhset wk f v PX 50
+        r exhset wk g v
+        r watch wk
+        after 100
+        assert_equal {} [r exhget wk f]
+        r multi
+        r ping
+        assert_equal {} [r exec]
+    }
+
+    test {A read that expires the last field deletes the key} {
+        foreach cmd {exhget exhgetwithver exhver exhexists exhstrlen exhttl} {
+            r del wk
+            r exhset wk f v PX 50
+            after 100
+            r $cmd wk f
+            assert_equal 0 [r exists wk]
+        }
+    }
+}
+
+start_server {tags {"tairhash failed-writes"}} {
+    r module load $testmodule
+
+    test {A write that fails creates no hash} {
+        r del nk
+        catch {r exhincrby nk f 5 MAX 3} err
+        assert_match {*overflow*} $err
+        catch {r exhincrbyfloat nk f 5 MAX 3} err
+        assert_match {*overflow*} $err
+        catch {r exhmsetwithopts nk f v 0 notanumber} err
+        assert_match {*syntax*} $err
+        catch {r exhmset nk} err
+        assert_match {*wrong number of arguments*} $err
+        catch {r exhmsetwithopts nk} err
+        assert_match {*wrong number of arguments*} $err
+        assert_equal 0 [r exists nk]
+    }
+
+    test {A write that fails after expiring the last field deletes the hash} {
+        r del nk
+        r exhset nk f 1 PX 50
+        after 100
+        catch {r exhincrby nk f 5 MAX 3} err
+        assert_equal 0 [r exists nk]
+
+        r exhset nk f 1 PX 50
+        after 100
+        catch {r exhincrbyfloat nk f 5 MAX 3} err
+        assert_equal 0 [r exists nk]
+
+        r exhset nk f v PX 50
+        after 100
+        assert_equal -1 [r exhset nk f v XX]
+        assert_equal 0 [r exists nk]
+
+        r exhset nk f v PX 50
+        after 100
+        assert_equal 0 [r exhpersist nk f]
+        assert_equal 0 [r exists nk]
+
+        r exhset nk f v PX 50
+        r exhset nk g v
+        after 100
+        catch {r exhmsetwithopts nk f v 0 0 g v 9 0} err
+        assert_match {*version*} $err
+        assert_equal {g} [r exhkeys nk]
+        r del nk
+    }
+
+    test {Expire times that do not fit are rejected} {
+        r del ok
+        catch {r exhset ok f v EX 9223372036854775} err
+        assert_match {*invalid expire*} $err
+        catch {r exhset ok f v PX 9223372036854775807} err
+        assert_match {*invalid expire*} $err
+        catch {r exhset ok f v EXAT 9223372036854775807} err
+        assert_match {*invalid expire*} $err
+        assert_equal 0 [r exists ok]
+
+        r exhset ok f v
+        catch {r exhexpire ok f 9223372036854775} err
+        assert_match {*invalid expire*} $err
+        catch {r exhpexpire ok f 9223372036854775807} err
+        assert_match {*invalid expire*} $err
+        catch {r exhincrby ok n 1 EX 9223372036854775} err
+        assert_match {*invalid expire*} $err
+        catch {r exhmsetwithopts ok a 1 0 9223372036854775 b 2 0 100} err
+        assert_match {*invalid expire*} $err
+        assert_equal -1 [r exhttl ok f]
+        assert_equal {f} [r exhkeys ok]
+        r del ok
+    }
+
+    test {Writes that would take a version past its maximum are rejected} {
+        r del ok
+        r exhset ok f 1 ABS 9223372036854775807
+        catch {r exhset ok f 2} err
+        assert_match {*version would overflow*} $err
+        catch {r exhincrby ok f 1} err
+        assert_match {*version would overflow*} $err
+        catch {r exhincrbyfloat ok f 1} err
+        assert_match {*version would overflow*} $err
+        catch {r exhexpire ok f 100} err
+        assert_match {*version would overflow*} $err
+        catch {r exhmset ok f 3 g 4} err
+        assert_match {*version would overflow*} $err
+        catch {r exhmsetwithopts ok f 3 0 100} err
+        assert_match {*version would overflow*} $err
+        assert_equal {1 9223372036854775807} [r exhgetwithver ok f]
+        assert_equal -1 [r exhttl ok f]
+        # A write that sets the version explicitly still applies.
+        assert_equal 0 [r exhset ok f 5 ABS 7]
+        assert_equal {5 7} [r exhgetwithver ok f]
+        r del ok
+    }
+
+    test {EXHDELWITHVER validates every version before deleting} {
+        r del nk
+        r exhset nk f v
+        r exhset nk g v
+        catch {r exhdelwithver nk f 1 g notanumber} err
+        assert_match {*syntax*} $err
+        assert_equal 2 [r exhlen nk]
+        r del nk
+    }
+}
+
+start_server {tags {"tairhash databases"} overrides {databases 32}} {
+    r module load $testmodule
+
+    test {Fields expire in databases past the 16th} {
+        r select 20
+        r del k
+        r exhset k f v PX 100
+        r exhset k g v
+        wait_for_condition 50 100 {
+            [r exhlen k] == 1
+        } else {
+            fail "the field in db 20 was not actively expired"
+        }
+        assert_match {*db: 20, active_expired_fields: 1,*} [r exhexpireinfo]
+
+        r select 31
+        r del m
+        r exhset m f v PX 300
+        r move m 25
+        r select 25
+        wait_for_condition 50 100 {
+            [r exists m] == 0
+        } else {
+            fail "the field moved to db 25 was not actively expired"
+        }
+        r flushall
+        r select 9
+    }
+}
+
+start_server {tags {"tairhash lazyfree"}} {
+    r module load $testmodule
+
+    test {A hash freed on the lazyfree thread inside a transaction} {
+        # More than 64 fields make UNLINK free the hash on the lazyfree thread while EXEC still
+        # holds the arguments of the writes queued before it.
+        set args {}
+        for {set i 0} {$i < 100} {incr i} {
+            lappend args f$i v$i 0 100
+        }
+        for {set round 0} {$round < 20} {incr round} {
+            r multi
+            r exhmsetwithopts lk {*}$args
+            r exhset lk extra v EX 100
+            r unlink lk
+            r exec
+        }
+        assert_equal 0 [r exists lk]
+        assert_equal PONG [r ping]
+    }
+}
+
