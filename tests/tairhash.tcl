@@ -499,6 +499,126 @@ start_server {tags {"tairhash"} overrides {bind 0.0.0.0}} {
         assert_equal 0 [r dbsize]
     }
 
+    proc expire_info_field {name} {
+        if {![regexp "$name:(\[^\r\n\]+)" [r exhexpireinfo] -> value]} {
+            fail "exhexpireinfo has no $name"
+        }
+        return $value
+    }
+
+    proc expiring_keys {} {
+        return [expire_info_field tair_hash_expiring_keys]
+    }
+
+    proc scan_calls {} {
+        if {[regexp {cmdstat_scan:calls=([0-9]+)} [r info commandstats] -> calls]} {
+            return $calls
+        }
+        return 0
+    }
+
+    test {Exhexpireinfo reports the expire mode} {
+        assert {[expire_info_field tair_hash_active_expire_mode] in {scan sort slab}}
+    }
+
+    test {Exhexpireinfo counts the keys with expiring fields} {
+        r flushall
+        # Hashes that earlier tests freed on the lazy-free thread stay counted until it frees them.
+        wait_for_condition 50 100 {
+            [expiring_keys] == 0
+        } else {
+            fail "flushed keys are still counted"
+        }
+        r exhset nottl f v
+        assert_equal 0 [expiring_keys]
+
+        r exhset k1 f1 v ex 100
+        r exhset k1 f2 v ex 100
+        r exhset k2 f v px 100000
+        assert_equal 2 [expiring_keys]
+
+        r exhpersist k2 f
+        assert_equal 1 [expiring_keys]
+        r exhset k2 f v ex 100
+        r exhdel k2 f
+        assert_equal 1 [expiring_keys]
+
+        r exhset k3 f v ex 100
+        r del k3
+        assert_equal 1 [expiring_keys]
+
+        r rename k1 k1renamed
+        assert_equal 1 [expiring_keys]
+        r debug reload
+        # The server can free the dataset it replaced on the lazy-free thread, which uncounts it later.
+        wait_for_condition 50 100 {
+            [expiring_keys] == 1
+        } else {
+            fail "reloaded keys are not counted once"
+        }
+
+        r exhset passive f v px 50
+        after 100
+        assert_equal {} [r exhget passive f]
+        assert_equal 1 [expiring_keys]
+
+        r flushall
+        wait_for_condition 50 100 {
+            [expiring_keys] == 0
+        } else {
+            fail "flushed keys are still counted"
+        }
+    }
+
+    test {Exhexpireinfo counts a key freed on a lazy-free thread} {
+        r flushall
+        create_big_tairhash_with_expire big 1000 100
+        assert_equal 1 [expiring_keys]
+        r unlink big
+        wait_for_condition 50 100 {
+            [expiring_keys] == 0
+        } else {
+            fail "unlinked key is still counted"
+        }
+
+        create_big_tairhash_with_expire big 1000 100
+        r flushall async
+        wait_for_condition 50 100 {
+            [expiring_keys] == 0
+        } else {
+            fail "keys flushed asynchronously are still counted"
+        }
+    }
+
+    test {Active expire scans only while a field can expire} {
+        r flushall
+        for {set j 0} {$j < 100} {incr j} {
+            r set plain$j v
+        }
+        r exhset nottl f v
+        r config resetstat
+        # Two active expire periods.
+        after 2100
+        assert_equal 0 [scan_calls]
+
+        r exhset expiring f v px 300
+        wait_for_condition 50 100 {
+            [r exists expiring] == 0
+        } else {
+            fail "expiring was not actively expired"
+        }
+        assert_equal 0 [expiring_keys]
+        if {[expire_info_field tair_hash_active_expire_mode] eq "scan"} {
+            assert {[scan_calls] > 0}
+        } else {
+            assert_equal 0 [scan_calls]
+        }
+
+        r config resetstat
+        after 2100
+        assert_equal 0 [scan_calls]
+    }
+
     test {Rename with active expire} {
         r flushall
         create_big_tairhash_with_expire exk1 10 2
@@ -883,6 +1003,122 @@ start_server {tags {"tairhash"} overrides {bind 0.0.0.0}} {
                 assert_lessthan [expr {abs($reported - $allocated)}] [expr {$allocated / 10}]
             }
         }
+    }
+
+    test {Field values grow and shrink in place and across reallocation, also while rehashing} {
+        r del k
+        set want [dict create]
+        # Enough fields that the table is rehashing while values are resized.
+        for {set i 0} {$i < 600} {incr i} {
+            dict set want f$i [string repeat a [expr {$i % 7}]]
+            r exhset k f$i [dict get $want f$i]
+            if {$i % 3 == 0} {
+                set resized f[expr {$i / 2}]
+                dict set want $resized [string repeat b [expr {($i * 37) % 300}]]
+                r exhset k $resized [dict get $want $resized]
+            }
+        }
+        for {set round 0} {$round < 3} {incr round} {
+            foreach len {0 1 13 64 200 3 1000 2} {
+                dict set want f17 [string repeat c $len]
+                r exhset k f17 [string repeat c $len]
+                assert_equal $len [r exhstrlen k f17]
+                assert_equal [string repeat c $len] [r exhget k f17]
+            }
+        }
+        assert_equal 600 [r exhlen k]
+        set digest [r debug digest-value k]
+        # Every field holds the last value written to it, before and after a reload.
+        foreach reload {0 1} {
+            if {$reload} {
+                r debug reload
+                assert_equal $digest [r debug digest-value k]
+            }
+            set got [r exhgetall k]
+            assert_equal 1200 [llength $got]
+            dict for {f v} $want {
+                assert_equal $v [dict get $got $f]
+            }
+        }
+    }
+
+    test {Exhscan returns every field across rehashing} {
+        r del k
+        # 250 fields fill a table of 256 buckets; the writes between scan calls make it grow to 512
+        # after a few calls, and it then rehashes incrementally for most of the scan.
+        for {set i 0} {$i < 250} {incr i} {
+            r exhset k f$i v$i
+        }
+        set seen {}
+        set cursor 0
+        set i 250
+        while 1 {
+            set reply [r exhscan k $cursor COUNT 10]
+            set cursor [lindex $reply 0]
+            foreach {f v} [lindex $reply 1] {
+                dict set seen $f $v
+            }
+            r exhset k f$i v$i
+            r exhset k f[expr {$i + 1}] v[expr {$i + 1}]
+            incr i 2
+            if {$cursor == 0} break
+        }
+        assert {$i > 262}
+        for {set j 0} {$j < 250} {incr j} {
+            assert_equal v$j [dict get $seen f$j]
+        }
+    }
+
+    test {A value that grows or shrinks keeps the field's TTL and version} {
+        r del gk
+        r exhset gk f [string repeat a 10] EX 1000
+        r exhset gk f [string repeat b 3000] KEEPTTL
+        assert {[r exhttl gk f] >= 990}
+        assert_equal 2 [r exhver gk f]
+        r exhset gk f [string repeat c 5] KEEPTTL
+        assert {[r exhttl gk f] >= 990}
+        assert_equal [string repeat c 5] [r exhget gk f]
+        # Without KEEPTTL a write clears the TTL, whatever the new size.
+        r exhset gk f [string repeat d 4000]
+        assert_equal -1 [r exhttl gk f]
+        r del gk
+    }
+
+    test {Binary and empty names and values survive RDB and AOF rewrite} {
+        r del bk
+        r exhset bk "" empty-name
+        r exhset bk empty-value ""
+        r exhset bk "a\x00b" "c\x00d" EX 1000
+        set want [lsort [r exhgetall bk]]
+        r debug reload
+        assert_equal $want [lsort [r exhgetall bk]]
+        r config set aof-use-rdb-preamble no
+        r config set appendonly yes
+        waitForBgrewriteaof r
+        r debug loadaof
+        assert_equal $want [lsort [r exhgetall bk]]
+        assert {[r exhttl bk "a\x00b"] >= 990}
+        r config set appendonly no
+        r config set aof-use-rdb-preamble yes
+        r del bk
+    }
+
+    test {A large hash stays consistent under interleaved updates and deletes} {
+        r del k
+        for {set i 0} {$i < 5000} {incr i} {
+            r exhset k f$i $i
+        }
+        for {set i 0} {$i < 5000} {incr i 2} {
+            r exhdel k f$i
+        }
+        for {set i 1} {$i < 5000} {incr i 4} {
+            r exhset k f$i [string repeat x 100]
+        }
+        assert_equal 2500 [r exhlen k]
+        assert_equal 2500 [llength [r exhkeys k]]
+        assert_equal "" [r exhget k f0]
+        assert_equal 3 [r exhget k f3]
+        assert_equal [string repeat x 100] [r exhget k f1]
     }
 
     test {Exhdelwithver} {
@@ -2653,6 +2889,99 @@ start_server {tags {"tairhash passive-expire"}} {
         assert_equal new [r exhget nx f5]
         assert_equal 0 [r exhsetnx nx f5 newer]
         r del nx
+    }
+
+    test {Passive expiry of fields whose names only the expire index still holds} {
+        r select 12
+        r flushdb
+        # SLAB mode has no passive expiry.
+        set passive [expr {[expire_info_field tair_hash_active_expire_mode] ne "slab"}]
+
+        r exhset k live v
+        r exhset k f1 v EX 1000
+        r exhset k f2 v EX 1000
+        # Moving a TTL into the past runs no expiry: f1 and f2 are expired and still in the hash.
+        r exhpexpireat k f1 1
+        r exhpexpireat k f2 1
+        assert_equal 3 [r exhlen k]
+        # This write expires them first, through the names the index holds and frees with them.
+        r exhset k f3 v
+        assert_equal [expr {$passive ? 2 : 4}] [r exhlen k]
+        assert_equal 2 [r exhlen k noexp]
+        assert_equal {} [r exhget k f1]
+        assert_equal {} [r exhget k f2]
+        r del k
+    }
+
+    test {Full reads leave out an expired field whichever command gave it its TTL} {
+        r select 12
+        r flushdb
+        set reads {exhkeys live exhvals v exhgetall {live v} exhgetallwithver {live v 1}}
+        # Each script leaves `dead` as the only field of fr with a TTL, one that has passed.
+        set expirers {
+            {r exhset fr dead v PX 0}
+            {r exhset fr dead v EXAT 1}
+            {r exhset fr dead v; r exhexpire fr dead 0}
+            {r exhset fr dead v; r exhpexpireat fr dead 1}
+            {r exhmsetwithopts fr dead v 0 1000; r exhpexpireat fr dead 1}
+            {r exhincrby fr dead 1 PXAT 1}
+            {r exhincrbyfloat fr dead 1 EX 0}
+            {r exhset fr dead v PXAT 1; r debug reload}
+            {r exhset fr dead v PXAT 1; set dump [r dump fr]; r del fr; r restore fr 0 $dump}
+        }
+        foreach expirer $expirers {
+            foreach {read want} $reads {
+                r del fr
+                r exhset fr live v
+                eval $expirer
+                # EXHLEN removes nothing, so `dead` is still in the hash for the read.
+                assert_equal 1 [r exhlen fr noexp]
+                assert_equal 2 [r exhlen fr]
+                assert_equal $want [r $read fr]
+            }
+        }
+        # A copy, where the server and the expire mode can make one.
+        foreach {read want} $reads {
+            r del fr fr2
+            r exhset fr live v
+            r exhset fr dead v PXAT 1
+            if {![catch {r copy fr fr2} copied] && $copied == 1} {
+                assert_equal 2 [r exhlen fr2]
+                assert_equal $want [r $read fr2]
+            }
+        }
+        r del fr fr2
+    }
+
+    test {Full reads leave out an expired field after the TTL of another field went away} {
+        r select 12
+        r flushdb
+        # Each script takes away `other` or its TTL, replaces the value of `dead`, or removes a
+        # third field that expired, while `dead` has a TTL. The fields left alive follow it.
+        set removers {
+            {r exhdel fr other} {live}
+            {r exhdelwithver fr other 0} {live}
+            {r exhpersist fr other} {live other}
+            {r exhset fr other v} {live other}
+            {r exhincrby fr other 1} {live other}
+            {r exhincrbyfloat fr other 1} {live other}
+            {r exhpersist fr other; r exhset fr dead [string repeat x 3000] KEEPTTL} {live other}
+            {r exhpersist fr other; r exhset fr gone v PXAT 1; r exhget fr gone} {live other}
+            {r exhpersist fr other; r exhset fr gone v PXAT 1; r exhset fr new v} {live new other}
+        }
+        foreach {remover alive} $removers {
+            r del fr
+            r exhset fr live v
+            r exhset fr other 1 EX 1000
+            r exhset fr dead v EX 1000
+            eval $remover
+            # Moving the TTL into the past runs no expiry, so `dead` stays in the hash for the read.
+            assert_equal 1 [r exhpexpireat fr dead 1]
+            assert_equal [llength $alive] [r exhlen fr noexp]
+            assert {[r exhlen fr] > [llength $alive]}
+            assert_equal $alive [lsort [r exhkeys fr]]
+        }
+        r del fr
     }
 
     start_server {} {

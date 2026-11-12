@@ -17,16 +17,45 @@
 
 #if (!defined SORT_MODE) && (!defined SLAB_MODE)
 
+#include <stdatomic.h>
+
 extern ExpireAlgorithm g_expire_algorithm;
 extern RedisModuleType *TairHashType;
+
+/* SCAN mode keeps no list of the hashes with expiring fields, only how many there are, so
+ * the timer can skip scanning while there is nothing to find. Atomic because the server may
+ * free a value on a lazy-free thread. */
+static atomic_ullong expiring_keys = 0;
+
+/* Counts obj in or out when its expire index went from empty to non-empty or back. */
+static void trackExpiringKey(unsigned long before, const tairHashObj *obj) {
+    unsigned long after = TAIRHASH_EXPIRE_INDEX_LEN(obj);
+    if (before == 0 && after != 0) {
+        atomic_fetch_add_explicit(&expiring_keys, 1, memory_order_relaxed);
+    } else if (before != 0 && after == 0) {
+        atomic_fetch_sub_explicit(&expiring_keys, 1, memory_order_relaxed);
+    }
+}
+
+unsigned long long expiringKeyCount(void) {
+    return atomic_load_explicit(&expiring_keys, memory_order_relaxed);
+}
+
+void expiringKeyReleased(const tairHashObj *o) {
+    if (TAIRHASH_EXPIRE_INDEX_LEN(o) != 0) {
+        atomic_fetch_sub_explicit(&expiring_keys, 1, memory_order_relaxed);
+    }
+}
 
 void insert(RedisModuleCtx *ctx, int dbid, RedisModuleString *key, tairHashObj *obj, RedisModuleString *field, long long expire) {
     REDISMODULE_NOT_USED(ctx);
     REDISMODULE_NOT_USED(dbid);
     REDISMODULE_NOT_USED(key);
     if (expire) {
+        unsigned long before = TAIRHASH_EXPIRE_INDEX_LEN(obj);
         tairHashEnsureExpireIndex(obj);
         m_zslInsert(obj->expire_index, expire, ownString(field));
+        trackExpiringKey(before, obj);
     }
 }
 
@@ -44,11 +73,18 @@ void delete(RedisModuleCtx *ctx, int dbid, RedisModuleString *key, tairHashObj *
     REDISMODULE_NOT_USED(dbid);
     REDISMODULE_NOT_USED(key);
     if (cur_expire != 0) {
+        unsigned long before = TAIRHASH_EXPIRE_INDEX_LEN(obj);
         m_zslDelete(obj->expire_index, cur_expire, field, NULL);
+        trackExpiringKey(before, obj);
     }
 }
 
 void activeExpire(RedisModuleCtx *ctx, int dbid, uint64_t keys_per_loop) {
+    /* Without a field waiting to expire a scan finds nothing, yet opens every key it visits. */
+    if (expiringKeyCount() == 0) {
+        return;
+    }
+
     tairHashObj *tair_hash_obj = NULL;
     m_zskiplistNode *ln = NULL;
     m_zskiplistNode *ln2 = NULL;
@@ -153,7 +189,7 @@ void activeExpire(RedisModuleCtx *ctx, int dbid, uint64_t keys_per_loop) {
             /* EXHDELREPL, which expires the field, takes its entry out of the index, and with the
              * last field of the hash it deletes the key: the hash may be gone when it returns. */
             m_zskiplistNode *next = ln2->level[0].forward;
-            if (dictSize(tair_hash_obj->hash) == 1) {
+            if (ftSize(&tair_hash_obj->hash) == 1) {
                 may_delkey = 1;
             }
             field = ln2->member;
@@ -183,22 +219,22 @@ void passiveExpire(RedisModuleCtx *ctx, int dbid, RedisModuleString *key) {
     RedisModuleKey *real_key;
     unsigned long zsl_len;
     int may_delkey = 0;
-    /* 1. The current db does not have a key that needs to expire. */
-    list *keys = m_listCreate();
+    int has_expiring = 0;
 
+    /* 1. Nothing to do unless the key is a tairhash with expiring fields; decide that
+     * before allocating anything, since this runs before every write. */
     real_key = RedisModule_OpenKey(ctx, key, REDISMODULE_READ | REDISMODULE_WRITE);
     if (RedisModule_KeyType(real_key) != REDISMODULE_KEYTYPE_EMPTY && RedisModule_ModuleTypeGetType(real_key) == TairHashType) {
         tair_hash_obj = RedisModule_ModuleTypeGetValue(real_key);
-        if (TAIRHASH_EXPIRE_INDEX_LEN(tair_hash_obj) > 0) {
-            m_listAddNodeTail(keys, key);
-        }
+        has_expiring = TAIRHASH_EXPIRE_INDEX_LEN(tair_hash_obj) > 0;
     }
     RedisModule_CloseKey(real_key);
-
-    if (listLength(keys) == 0) {
-        m_listRelease(keys);
+    if (!has_expiring) {
         return;
     }
+
+    list *keys = m_listCreate();
+    m_listAddNodeTail(keys, key);
 
     /* 3. Delete expired field. */
     int keys_per_loop = g_expire_algorithm.keys_per_passive_loop;
@@ -221,7 +257,7 @@ void passiveExpire(RedisModuleCtx *ctx, int dbid, RedisModuleString *key) {
         }
 
         tair_hash_obj = RedisModule_ModuleTypeGetValue(real_key);
-        if (dictSize(tair_hash_obj->hash) == 1) {
+        if (ftSize(&tair_hash_obj->hash) == 1) {
             may_delkey = 1;
         }
         RedisModule_CloseKey(real_key);
@@ -291,8 +327,12 @@ int deleteAndPropagate(RedisModuleCtx *ctx, int dbid, RedisModuleString *key, ta
         RedisModuleString *key_dup = RedisModule_CreateStringFromString(NULL, key);
         /* field may be the expire index's own copy of the name, which deleting the index entry frees. */
         RedisModuleString *field_dup = RedisModule_CreateStringFromString(NULL, field);
+        unsigned long before = TAIRHASH_EXPIRE_INDEX_LEN(obj);
         m_zslDelete(obj->expire_index, expire, field_dup, NULL);
-        m_dictDelete(obj->hash, field_dup);
+        trackExpiringKey(before, obj);
+        size_t field_len;
+        const char *field_ptr = RedisModule_StringPtrLen(field_dup, &field_len);
+        ftDelete(&obj->hash, field_ptr, field_len);
         RedisModule_Replicate(ctx, "EXHDEL", "ss", key_dup, field_dup);
         notifyFieldSpaceEvent("expired", key_dup, field_dup, dbid);
         RedisModule_FreeString(NULL, key_dup);
