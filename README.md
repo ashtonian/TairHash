@@ -21,14 +21,16 @@
 - Supports setting expiration and version for field
 - Support efficient active expiration (SCAN mode, SORT mode and SLAB mode) and passivity expiration for field
 - Support field expired event notification (based on pubsub)
+- Supports last-write-wins writes and deletes and source-of-truth sync (`EXHMSETLWW`, `EXHDELLWW`, `EXHSYNCGET`, `EXHSYNCBEGIN`, `EXHSYNC`), so a TairHash can cache an external store without serving a partial or stale copy; see [Last-write-wins and source-of-truth sync](CMDDOC.md#last-write-wins-and-source-of-truth-sync)
 
 ## Memory
 
-Each field is one allocation holding its name, value, version and TTL, chained directly into
-the hash table. A key of 30 fields with 8-byte names and values takes about 1.9KB in all
-(`bench/profile.sh`, Redis 7.0, jemalloc), against about 5.2KB with one dict entry, value
-struct and two string objects per field. The expire index is allocated only once a field of
-the key gets a TTL. `MEMORY USAGE` reports what the allocator actually holds for a key.
+Each field is one allocation holding its name, value, version, TTL and write sequence, chained
+directly into the hash table. A key of 30 fields with 8-byte names and values took about 1.9KB
+in all in TairHash 2.0 (`bench/profile.sh`, Redis 7.0, jemalloc), against about 5.2KB with one
+dict entry, value struct and two string objects per field; the write sequence adds 8 bytes per
+field. The expire index is allocated only once a field of the key gets a TTL. `MEMORY USAGE`
+reports what the allocator actually holds for a key.
 
 ## Active expiration
 ### SCAN_MODE(default):
@@ -166,19 +168,34 @@ Pass options as `name value` pairs after the module path, for example
 | `active_expire_keys_per_loop` | integer | `1000` | Keys (SCAN mode: the SCAN count) examined per database per active expire cycle. |
 | `active_expire_dbs_per_loop` | integer | `16` | Databases visited per active expire cycle. |
 | `passive_expire_keys_per_loop` | integer | `3` | Expired fields removed per passive expiry check. |
+| `lww_tombstone_ttl` | seconds | `3600` | How long a tombstone left by `EXHDELLWW` holds off writes with the same or a lower version. Make it longer than a delete can take to overtake the writes it supersedes, including a sync's snapshot read. |
+| `sync_lease_ttl` | seconds | `60` | How long an `EXHSYNCBEGIN` lease, and the placeholder it creates for a missing key, lasts. Make it longer than reading a snapshot from the source takes. |
 | `replication_format` | `state` or `compat` | `state` | How writes reach replicas and the AOF: `state` sends one internal `EXHMSETREPL` (or `EXHMETAREPL`) per write, `compat` one `EXHSET`/`EXHSETNX` per field, which TairHash 1.x also accepts. See [Upgrading from 1.x](#upgrading-from-1x). On Redis 7.0+ and Valkey it is also the module config `tairhash.replication_format`, which `CONFIG SET` changes at runtime; a value for it in the config file takes precedence over the load argument. |
+
+## Upgrading from 2.0
+
+TairHash 2.1 writes RDB encoding version 1 (sync state, tombstones and per-field write
+sequence, plus the sync epoch as module aux data, so its RDBs need the module loaded even
+without TairHash keys) and still loads version 0: TairHash 2.0 cannot load an RDB that 2.1
+wrote, so upgrade
+replicas before their master and keep a pre-upgrade RDB if a downgrade must stay
+possible. 2.1 replicates with `EXHMSETREPL` layout 2, which 2.0 rejects; run 2.1 with
+`replication_format compat` until every node runs it, as for an upgrade from 1.x below.
 
 ## Upgrading from 1.x
 
-TairHash 2.0 replicates each write as one `EXHMSETREPL` or `EXHMETAREPL`, which TairHash 1.x
-does not know: a 1.x replica of a 2.0 master logs an error for every write and drops it. The RDB
-encoding is unchanged. Upgrade with `replication_format compat` until every node runs 2.0:
+TairHash 2.x replicates each write as one `EXHMSETREPL` or `EXHMETAREPL`, which TairHash 1.x
+does not know: a 1.x replica of a 2.x master logs an error for every write and drops it. 2.0
+keeps the RDB encoding of 1.x; 2.1 writes a new one, with the write sequence and the sync
+state, that 1.x and 2.0 cannot load, so a node older than 2.1 cannot do a full sync from a
+2.1 node. Upgrade with `replication_format compat` until every node runs 2.x:
 
 1. Start every upgraded node with `replication_format compat` (on Redis 7.0+ and Valkey,
    `tairhash.replication_format compat` in the config file works too). Upgrade replicas
    first, fail over, then upgrade the former masters: a 1.x node may then replicate from a
-   2.0 node during the failover, which `compat` keeps working.
-2. Confirm that `MODULE LIST` reports `ver 20000` for `tairhash` on every node, including
+   2.x node during the failover, which `compat` keeps working (from a 2.1 node only as long
+   as it needs no full sync, see above).
+2. Confirm that `MODULE LIST` reports `ver 20100` for `tairhash` on every node, including
    chained replicas: a replica passes its master's stream on unchanged, so replicas at
    every depth receive what the top-level master sends.
 3. Switch every node to `state`: `CONFIG SET tairhash.replication_format state` on Redis
@@ -187,7 +204,9 @@ encoding is unchanged. Upgrade with `replication_format compat` until every node
 To downgrade, switch every node back to `compat` first, then run `BGREWRITEAOF` on each
 node so that its AOF holds no `EXHMSETREPL` or `EXHMETAREPL`, and replace the module. A
 node still in `state` writes what it applies from its master to its own AOF in the state
-format. On Redis 7.0+ and Valkey, setting
+format. `EXHMSETLWW`, `EXHDELLWW` and `EXHSYNC` replicate in the state format whatever the
+setting, and AOF rewrite emits `EXHSYNCREPL` and `EXHTOMBREPL` for hashes with sync state or
+tombstones in both formats, so neither can reach a node older than 2.1. On Redis 7.0+ and Valkey, setting
 `propagation-error-behavior panic-on-replicas` during the upgrade makes a replica that
 cannot apply the stream stop instead of silently diverging.
 
