@@ -306,6 +306,28 @@ type Entry struct {
 	Version int64
 }
 
+// VersionedRead is one key of GetWithVersionMany: the fields to read with their
+// versions, or every unexpired field when Fields is empty.
+type VersionedRead struct {
+	Key    string
+	Fields []string
+}
+
+// VersionedResult is the reply to one VersionedRead. Fields holds only the
+// fields that exist and haven't expired: in request order for a read that
+// named fields, in server order for a whole-hash read.
+type VersionedResult struct {
+	Fields []VersionedField
+	Err    error
+}
+
+// VersionedField is a field read with its value and version.
+type VersionedField struct {
+	Field   string
+	Value   string
+	Version int64
+}
+
 // FieldVersion names a field and the version a conditional delete expects.
 type FieldVersion struct {
 	Field   string

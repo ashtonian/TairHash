@@ -212,6 +212,7 @@ res, err := c.Set(ctx, "k", "f", "v", tairhash.SetArgs{
 | `Version`, `SetVersion` | `EXHVER`, `EXHSETVER` |
 | `Get`, `GetWithVersion`, `MGet`, `MGetWithVersion` | `EXHGET`, `EXHGETWITHVER`, `EXHMGET`, `EXHMGETWITHVER` |
 | `GetAll`, `GetAllWithVersion`, `Keys`, `Vals`, `Scan` | `EXHGETALL`, `EXHGETALLWITHVER`, `EXHKEYS`, `EXHVALS`, `EXHSCAN` |
+| `GetWithVersionMany` | `EXHMGETWITHVER` for each read that names fields and `EXHGETALLWITHVER` for each that doesn't, sent as one pipeline (`DoMulti`). Each `VersionedResult` holds the read's live fields, or its own error. |
 | `Del`, `DelWithVersion` | `EXHDEL`, `EXHDELWITHVER` |
 | `Len`, `Exists`, `StrLen` | `EXHLEN [NOEXP]`, `EXHEXISTS`, `EXHSTRLEN` |
 | `Ping` | Verifies the module is loaded (`ErrModuleNotLoaded` otherwise). |

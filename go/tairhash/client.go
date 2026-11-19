@@ -277,9 +277,12 @@ func (c *Client) MGetWithVersion(ctx context.Context, key string, fields ...stri
 	if len(fields) == 0 {
 		return nil, nil
 	}
-	msgs, err := c.vk.Do(ctx, c.vk.B().Arbitrary("EXHMGETWITHVER").Keys(key).Args(fields...).ReadOnly()).ToArray()
+	msgs, err := c.vk.Do(ctx, c.mgetWithVersionCmd(key, fields)).ToArray()
 	if err != nil {
 		return nil, opError("EXHMGETWITHVER", key, err)
+	}
+	if len(msgs) != len(fields) {
+		return nil, fmt.Errorf("EXHMGETWITHVER %q: reply has %d elements, want %d", key, len(msgs), len(fields))
 	}
 	out := make([]Field, len(msgs))
 	for i, m := range msgs {
@@ -287,10 +290,18 @@ func (c *Client) MGetWithVersion(ctx context.Context, key string, fields ...stri
 			continue
 		}
 		if out[i], err = parseVersioned(m); err != nil {
-			return nil, fmt.Errorf("EXHMGETWITHVER %q field %d: %w", key, i, err)
+			return nil, fmt.Errorf("EXHMGETWITHVER %q field %q: %w", key, fields[i], err)
 		}
 	}
 	return out, nil
+}
+
+func (c *Client) mgetWithVersionCmd(key string, fields []string) valkey.Completed {
+	return c.vk.B().Arbitrary("EXHMGETWITHVER").Keys(key).Args(fields...).ReadOnly()
+}
+
+func (c *Client) getAllWithVersionCmd(key string) valkey.Completed {
+	return c.vk.B().Arbitrary("EXHGETALLWITHVER").Keys(key).ReadOnly()
 }
 
 // GetAll returns every unexpired field (EXHGETALL).
@@ -304,30 +315,100 @@ func (c *Client) GetAll(ctx context.Context, key string) (map[string]string, err
 
 // GetAllWithVersion returns every unexpired field with its version (EXHGETALLWITHVER).
 func (c *Client) GetAllWithVersion(ctx context.Context, key string) (map[string]Entry, error) {
-	msgs, err := c.vk.Do(ctx, c.vk.B().Arbitrary("EXHGETALLWITHVER").Keys(key).ReadOnly()).ToArray()
+	msgs, err := c.vk.Do(ctx, c.getAllWithVersionCmd(key)).ToArray()
 	if err != nil {
 		return nil, opError("EXHGETALLWITHVER", key, err)
 	}
-	if len(msgs)%3 != 0 {
-		return nil, fmt.Errorf("EXHGETALLWITHVER %q: reply has %d elements, want a multiple of 3", key, len(msgs))
-	}
 	out := make(map[string]Entry, len(msgs)/3)
+	err = eachVersioned(msgs, func(f VersionedField) {
+		out[f.Field] = Entry{Value: f.Value, Version: f.Version}
+	})
+	if err != nil {
+		return nil, fmt.Errorf("EXHGETALLWITHVER %q: %w", key, err)
+	}
+	return out, nil
+}
+
+// GetWithVersionMany reads fields and their versions from several keys in one
+// round trip: EXHMGETWITHVER for a read that names fields, EXHGETALLWITHVER
+// for one that doesn't. Results are in the order of reads, and a failure is
+// reported on the result of the read it belongs to.
+func (c *Client) GetWithVersionMany(ctx context.Context, reads []VersionedRead) []VersionedResult {
+	out := make([]VersionedResult, len(reads))
+	if len(reads) == 0 {
+		return out
+	}
+	cmds := make(valkey.Commands, len(reads))
+	for i, r := range reads {
+		if len(r.Fields) == 0 {
+			cmds[i] = c.getAllWithVersionCmd(r.Key)
+		} else {
+			cmds[i] = c.mgetWithVersionCmd(r.Key, r.Fields)
+		}
+	}
+	for i, res := range c.vk.DoMulti(ctx, cmds...) {
+		out[i] = parseVersionedRead(reads[i], res)
+	}
+	return out
+}
+
+func parseVersionedRead(r VersionedRead, res valkey.ValkeyResult) VersionedResult {
+	name := "EXHMGETWITHVER"
+	if len(r.Fields) == 0 {
+		name = "EXHGETALLWITHVER"
+	}
+	msgs, err := res.ToArray()
+	if err != nil {
+		return VersionedResult{Err: opError(name, r.Key, err)}
+	}
+
+	if len(r.Fields) == 0 {
+		fields := make([]VersionedField, 0, len(msgs)/3)
+		err := eachVersioned(msgs, func(f VersionedField) { fields = append(fields, f) })
+		if err != nil {
+			return VersionedResult{Err: fmt.Errorf("%s %q: %w", name, r.Key, err)}
+		}
+		return VersionedResult{Fields: fields}
+	}
+
+	if len(msgs) != len(r.Fields) {
+		return VersionedResult{Err: fmt.Errorf("%s %q: reply has %d elements, want %d", name, r.Key, len(msgs), len(r.Fields))}
+	}
+	fields := make([]VersionedField, 0, len(msgs))
+	for i, m := range msgs {
+		if m.IsNil() {
+			continue
+		}
+		f, err := parseVersioned(m)
+		if err != nil {
+			return VersionedResult{Err: fmt.Errorf("%s %q field %q: %w", name, r.Key, r.Fields[i], err)}
+		}
+		fields = append(fields, VersionedField{Field: r.Fields[i], Value: f.Value, Version: f.Version})
+	}
+	return VersionedResult{Fields: fields}
+}
+
+// eachVersioned decodes EXHGETALLWITHVER's flat field, value, version triples.
+func eachVersioned(msgs []valkey.ValkeyMessage, fn func(VersionedField)) error {
+	if len(msgs)%3 != 0 {
+		return fmt.Errorf("reply has %d elements, want a multiple of 3", len(msgs))
+	}
 	for i := 0; i < len(msgs); i += 3 {
 		f, err := msgs[i].ToString()
 		if err != nil {
-			return nil, fmt.Errorf("EXHGETALLWITHVER %q: %w", key, err)
+			return fmt.Errorf("field name: %w", err)
 		}
 		v, err := msgs[i+1].ToString()
 		if err != nil {
-			return nil, fmt.Errorf("EXHGETALLWITHVER %q field %q: %w", key, f, err)
+			return fmt.Errorf("field %q value: %w", f, err)
 		}
 		ver, err := msgs[i+2].AsInt64()
 		if err != nil {
-			return nil, fmt.Errorf("EXHGETALLWITHVER %q field %q: %w", key, f, err)
+			return fmt.Errorf("field %q version: %w", f, err)
 		}
-		out[f] = Entry{Value: v, Version: ver}
+		fn(VersionedField{Field: f, Value: v, Version: ver})
 	}
-	return out, nil
+	return nil
 }
 
 // Keys returns every unexpired field name (EXHKEYS).

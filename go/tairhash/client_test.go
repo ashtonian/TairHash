@@ -72,6 +72,38 @@ func TestMultiFieldReads(t *testing.T) {
 	assert.Equal(t, int64(3), l)
 }
 
+func TestGetWithVersionMany(t *testing.T) {
+	c, ctx := newClient(t)
+	require.NoError(t, c.MSet(ctx, "k1", []FieldValue{{"a", "1"}, {"b", "2"}}))
+	_, err := c.Set(ctx, "k1", "a", "1b", SetArgs{Version: AdvanceVersion(50)})
+	require.NoError(t, err)
+	_, err = c.Set(ctx, "k1", "dead", "x", SetArgs{Expiry: past})
+	require.NoError(t, err)
+	require.NoError(t, c.MSet(ctx, "k2", []FieldValue{{"c", "3"}}))
+	require.NoError(t, c.vk.Do(ctx, c.vk.B().Set().Key("str").Value("x").Build()).Error())
+
+	got := c.GetWithVersionMany(ctx, []VersionedRead{
+		{Key: "k1", Fields: []string{"b", "missing", "dead", "a"}},
+		{Key: "k2"},
+		{Key: "str"},
+		{Key: "absent", Fields: []string{"a"}},
+		{Key: "absent"},
+	})
+	require.Len(t, got, 5)
+
+	require.NoError(t, got[0].Err)
+	assert.Equal(t, []VersionedField{{"b", "2", 1}, {"a", "1b", 50}}, got[0].Fields)
+	require.NoError(t, got[1].Err)
+	assert.Equal(t, []VersionedField{{"c", "3", 1}}, got[1].Fields)
+	assert.ErrorIs(t, got[2].Err, ErrWrongType, "a failed read leaves the others intact")
+	require.NoError(t, got[3].Err)
+	assert.Empty(t, got[3].Fields)
+	require.NoError(t, got[4].Err)
+	assert.Empty(t, got[4].Fields)
+
+	assert.Empty(t, c.GetWithVersionMany(ctx, nil))
+}
+
 func TestScanVisitsEveryField(t *testing.T) {
 	c, ctx := newClient(t)
 	want := map[string]string{}
