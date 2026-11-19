@@ -37,7 +37,7 @@
 - SCAN会打开访问到的每一个key（无论类型），因此当没有任何TairHash含有设置了过期时间的field时，定时器会跳过扫描
 - 排序索引为每个设置了过期时间的field保存一份field名的拷贝，没有设置过期时间的field不在索引中
 
-**支持的redis版本**: redis >= 5.0  
+**支持的版本**: redis >= 5.0, valkey >= 7.2  
 **优点**：可以运行在低版本的redis中（redis >= 5.0 ）      
 **缺点**：过期淘汰效率较低（相对SORT模式而言，特别是redis中含有过多的干扰key时）  
 
@@ -49,7 +49,7 @@
 - 内置定时器会周期扫描第一级索引，找出一部分已经过期的key，然后分别再检查这些key的二级索引，进行field的淘汰，也就是active expire
 - 第一级索引为每个key保存一份key名的拷贝，第二级索引为每个设置了过期时间的field保存一份field名的拷贝
 
-**支持的redis版本**: redis >= 7.0  
+**支持的版本**: redis >= 7.0, valkey >= 7.2  
 **优点**：过期淘汰效率比较高      
 **缺点**：更多的内存消耗  
 
@@ -60,7 +60,7 @@
 - 和SORT模式一样，也会依赖key的全局排序索引进行过期key的快速查找。和SORT模式不同的是，SLAB不会对key内部的field进行排序索引，相反他们是无序的，这样可以节省索引内存开销‘
 - SLAB过期算法使用SIMD指令（当硬件支持时）来加速对过期field的查找
 
-**支持的redis版本**: redis >= 7.0  
+**支持的版本**: redis >= 7.0, valkey >= 7.2  
 
 **优点**：高效淘汰，低内存消耗，快速访问，为过期算法带来新思路  
 
@@ -148,10 +148,11 @@ mkdir build
 cd build  
 cmake ../ && make -j
 ```
-编译成功后会在lib目录下产生tairhash_module.so库文件
+编译成功后会在lib目录下产生tairhash_module.so库文件（`cmake -DTAIRHASH_OUTPUT_DIR=<目录> ../` 可指定其他输出目录）
 
 ```
 ./redis-server --loadmodule /path/to/tairhash_module.so
+./valkey-server --loadmodule /path/to/tairhash_module.so
 ```  
 编译选项（`cmake -D<选项>=<值> ../`）：
 
@@ -199,9 +200,22 @@ TairHash 2.x把每次写入复制为一条 `EXHMSETREPL` 或 `EXHMETAREPL`，Tai
 
 ## 测试方法
 
-1. 修改`tests`目录下tairhash.tcl文件中的路径为`set testmodule [file your_path/tairhash_module.so]`
-2. 将`tests`目录下tairhash.tcl文件路径加入到redis的test_helper.tcl的all_tests中
-3. 在redis根目录下运行./runtest --single tairhash
+`tests/run.sh` 会编译模块，并在Redis或Valkey源码的测试框架中运行 `tests/` 下的TCL测试。CI的每个任务都通过该脚本运行，因此本地运行与CI执行相同的步骤。服务端源码只会在 `.deps/` 下克隆并编译一次；每种模块变体编译到 `build/` 下各自的目录。
+
+```
+tests/run.sh                                  # 所有测试，SCAN模式，Redis 7.0
+tests/run.sh --mode sort --suite tairhash     # 指定测试与过期模式
+tests/run.sh --sanitizer address              # 使用ASan编译模块与Redis
+tests/run.sh --coverage                       # 输出模块的行/函数覆盖率
+tests/run.sh --server-ref 7.2 -- --baseport 25000   # 其他Redis分支，附加runtest参数
+tests/run.sh --server valkey --server-ref 9.1.3     # 使用Valkey
+```
+
+依赖：C编译工具链、CMake 3.10+、git、Tcl 8.5+。macOS上 `long double` 为64位，`Exhincrbyfloat*` 测试会失败，Linux上正常。
+
+手动运行：将测试文件中的 `your_path` 替换为 `tairhash_module.so` 所在目录，复制到Redis或Valkey源码的 `tests/unit/type/` 下，运行 `./runtest --single unit/type/<suite>`。
+
+CI在x86-64与arm64上针对Redis 5.0、6.2、7.0、7.2、7.4、8.10以及Valkey 7.2、8.1、9.1运行所有测试；其中Redis 7.0覆盖所有过期模式，SCAN和SORT模式还会在AddressSanitizer下运行；Redis 8.10和Valkey 9.1的SCAN模式也会在AddressSanitizer下运行。
 
 ## 客户端
 

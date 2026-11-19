@@ -1,4 +1,4 @@
-cmake_minimum_required (VERSION 3.0)
+cmake_minimum_required (VERSION 3.10)
 
 project(tairhash_module)
 
@@ -51,7 +51,8 @@ endif(SANITIZER_MODE MATCHES "address")
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_C_VISIBILITY_PRESET hidden)
 
-SET(LIBRARY_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/lib)  
+set(TAIRHASH_OUTPUT_DIR ${PROJECT_SOURCE_DIR}/lib CACHE PATH "Directory the module library is written to")
+set(LIBRARY_OUTPUT_PATH ${TAIRHASH_OUTPUT_DIR})
 
 # Active expire algorithm. sort and slab need Redis/Valkey 7.0+; scan also runs on Redis 5.0 and 6.x.
 set(TAIRHASH_EXPIRE_MODE "" CACHE STRING "Active expire algorithm: sort (default), slab or scan")
